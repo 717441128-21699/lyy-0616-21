@@ -11,7 +11,7 @@ class Call:
     When the result is set via `set_result()`, all waiters are awakened.
     """
 
-    __slots__ = ("event", "result", "error", "started_at", "waiter_count")
+    __slots__ = ("event", "result", "error", "started_at", "waiter_count", "_done")
 
     def __init__(self):
         self.event = threading.Event()
@@ -19,17 +19,24 @@ class Call:
         self.error = None
         self.started_at = time.time()
         self.waiter_count = 0
+        self._done = False
 
     def set_result(self, result, error=None):
         self.result = result
         self.error = error
+        self._done = True
         self.event.set()
 
     def wait(self, timeout=None):
-        """Wait for the result. Returns (result, error)."""
+        """
+        Wait for the result. Returns (result, error, timed_out).
+        timed_out is True if the wait returned due to timeout before result was ready.
+        """
         self.waiter_count += 1
-        self.event.wait(timeout=timeout)
-        return self.result, self.error
+        finished = self.event.wait(timeout=timeout)
+        if not finished:
+            return None, None, True
+        return self.result, self.error, False
 
 
 class Singleflight:
@@ -46,18 +53,24 @@ class Singleflight:
     - Caller that "wins" the race executes the work function
     - Automatic key cleanup after result is delivered
     - Timeout support for stuck upstream requests
+    - Waiters wait as long as needed (matching the work function's timeout)
     """
 
-    def __init__(self, default_timeout=10.0):
+    def __init__(self, default_timeout=60.0):
         self._calls = {}
         self._lock = threading.Lock()
         self._default_timeout = default_timeout
         self._dedup_count = 0
         self._total_count = 0
+        self._timeout_count = 0
 
     def do(self, key, fn, timeout=None):
         """
         Execute fn for the given key, or wait for an in-flight call with the same key.
+
+        Waiters will wait for the full duration of the work function, even if it
+        takes a long time. They will only fail if the work function itself fails
+        or if the total timeout is exceeded.
 
         Args:
             key: A hashable key identifying the request (e.g., tuple (name, qtype))
@@ -86,7 +99,13 @@ class Singleflight:
                 self._calls[key] = call
 
         if is_duplicate:
-            result, error = call.wait(timeout=timeout)
+            result, error, timed_out = call.wait(timeout=timeout)
+            if timed_out:
+                with self._lock:
+                    self._timeout_count += 1
+                return None, TimeoutError(
+                    f"Singleflight wait timed out after {timeout}s"
+                ), True
             return result, error, True
 
         try:
@@ -109,11 +128,13 @@ class Singleflight:
             inflight = len(self._calls)
             total = self._total_count
             dedup = self._dedup_count
+            timeouts = self._timeout_count
             saved = (dedup / total * 100) if total > 0 else 0.0
             return {
                 "inflight": inflight,
                 "total_requests": total,
                 "deduped_requests": dedup,
+                "timeout_count": timeouts,
                 "saved_percent": saved,
             }
 
@@ -121,3 +142,4 @@ class Singleflight:
         with self._lock:
             self._total_count = 0
             self._dedup_count = 0
+            self._timeout_count = 0

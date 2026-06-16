@@ -302,6 +302,8 @@ class DNSResourceRecord:
         self.rclass = CLASS_IN
         self.ttl = 0
         self.rdata = b""
+        self._message_context = None
+        self._rdata_offset = 0
 
     @property
     def rdlength(self):
@@ -336,54 +338,101 @@ class DNSResourceRecord:
             raise DNSParseError("RR RDATA truncated")
 
         rr.rdata = bytes(data[offset : offset + rdlen])
+        rr._message_context = data
+        rr._rdata_offset = offset
         offset += rdlen
 
         return rr, offset
 
     def parse_rdata(self, data=None):
-        """Parse RDATA into a human-readable format based on record type."""
-        if data is None:
-            data = self.rdata
+        """
+        Parse RDATA into a human-readable format based on record type.
+
+        Uses the full message context (if available) to properly resolve
+        compression pointers in RDATA for CNAME, NS, MX records.
+        """
+        has_context = self._message_context is not None
+        full_msg = self._message_context if has_context else None
+        rdata_off = self._rdata_offset if has_context else 0
 
         if self.rtype == TYPE_A:
-            if len(data) != 4:
+            d = data if data is not None else self.rdata
+            if len(d) != 4:
                 return None
-            return ".".join(str(b) for b in data)
+            return ".".join(str(b) for b in d)
         elif self.rtype == TYPE_AAAA:
-            if len(data) != 16:
+            d = data if data is not None else self.rdata
+            if len(d) != 16:
                 return None
             parts = []
             for i in range(0, 16, 2):
-                parts.append(f"{data[i]:02x}{data[i+1]:02x}")
+                parts.append(f"{d[i]:02x}{d[i+1]:02x}")
             return ":".join(parts)
         elif self.rtype == TYPE_CNAME or self.rtype == TYPE_NS:
             try:
-                name, _ = parse_domain_name(data, 0)
+                if has_context:
+                    name, _ = parse_domain_name(full_msg, rdata_off)
+                else:
+                    d = data if data is not None else self.rdata
+                    name, _ = parse_domain_name(d, 0)
                 return name
             except (DNSParseError, DNSSecurityError):
                 return None
         elif self.rtype == TYPE_MX:
-            if len(data) < 3:
-                return None
-            preference = struct.unpack_from("!H", data, 0)[0]
             try:
-                exchange, _ = parse_domain_name(data, 2)
+                if has_context:
+                    if self._rdata_offset + 2 > len(full_msg):
+                        return None
+                    preference = struct.unpack_from("!H", full_msg, self._rdata_offset)[0]
+                    exchange, _ = parse_domain_name(full_msg, self._rdata_offset + 2)
+                else:
+                    d = data if data is not None else self.rdata
+                    if len(d) < 3:
+                        return None
+                    preference = struct.unpack_from("!H", d, 0)[0]
+                    exchange, _ = parse_domain_name(d, 2)
                 return (preference, exchange)
             except (DNSParseError, DNSSecurityError):
                 return None
         elif self.rtype == TYPE_TXT:
+            d = data if data is not None else self.rdata
             strings = []
             pos = 0
-            while pos < len(data):
-                slen = data[pos]
+            while pos < len(d):
+                slen = d[pos]
                 pos += 1
-                if pos + slen > len(data):
+                if pos + slen > len(d):
                     break
-                strings.append(data[pos : pos + slen].decode("utf-8", errors="replace"))
+                strings.append(d[pos : pos + slen].decode("utf-8", errors="replace"))
                 pos += slen
             return strings
+        elif self.rtype == TYPE_SOA:
+            try:
+                if has_context:
+                    mname, next_off = parse_domain_name(full_msg, self._rdata_offset)
+                    rname, next_off = parse_domain_name(full_msg, next_off)
+                    serial, refresh, retry, expire, minimum = struct.unpack_from(
+                        "!IIIII", full_msg, next_off)
+                else:
+                    d = data if data is not None else self.rdata
+                    mname, next_off = parse_domain_name(d, 0)
+                    rname, next_off = parse_domain_name(d, next_off)
+                    serial, refresh, retry, expire, minimum = struct.unpack_from(
+                        "!IIIII", d, next_off)
+                return {
+                    "mname": mname,
+                    "rname": rname,
+                    "serial": serial,
+                    "refresh": refresh,
+                    "retry": retry,
+                    "expire": expire,
+                    "minimum": minimum,
+                }
+            except Exception:
+                return None
         else:
-            return data.hex()
+            d = data if data is not None else self.rdata
+            return d.hex()
 
     @classmethod
     def create_a(cls, name, ip, ttl=300):

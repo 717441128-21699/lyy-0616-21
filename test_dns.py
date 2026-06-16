@@ -18,6 +18,9 @@ import threading
 import socket
 import sys
 import os
+import select
+import random
+import concurrent.futures
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -36,10 +39,12 @@ from dns_message import (
     CLASS_IN,
     RCODE_NOERROR,
     RCODE_NXDOMAIN,
+    RCODE_SERVFAIL,
     MAX_LABEL_LENGTH,
     MAX_DOMAIN_LENGTH,
     MAX_POINTER_JUMPS,
     MAX_RDATA_LENGTH,
+    MAX_UDP_PAYLOAD,
     DNSSecurityError,
     DNSParseError,
 )
@@ -47,13 +52,14 @@ from dns_cache import DNSCache, CacheEntry
 from singleflight import Singleflight
 from dns_authority import AuthorityZone, AuthorityStore
 from dns_server import DNSServer
+from dns_resolver import DNSResolver, ResolveError
 
 
 _passed = 0
 _failed = 0
 
 
-def test(name):
+def _test_case(name):
     """Decorator to mark a test function."""
     def decorator(fn):
         def wrapper(*args, **kwargs):
@@ -76,7 +82,7 @@ def test(name):
 # DNS Message Parsing Tests
 # ============================================================
 
-@test("Parse simple domain name without compression")
+@_test_case("Parse simple domain name without compression")
 def test_parse_simple_domain():
     data = b"\x03www\x07example\x03com\x00"
     name, offset = parse_domain_name(data, 0)
@@ -84,7 +90,7 @@ def test_parse_simple_domain():
     assert offset == 1 + 3 + 1 + 7 + 1 + 3 + 1
 
 
-@test("Parse domain with compression pointer (backward jump)")
+@_test_case("Parse domain with compression pointer (backward jump)")
 def test_parse_compression_pointer():
     data = (
         b"\x03foo\x00"
@@ -98,7 +104,7 @@ def test_parse_compression_pointer():
     assert off2 == off1 + 6  # "bar" (4 bytes: len+3) + pointer (2 bytes) = 6
 
 
-@test("Reject compression pointer that jumps forward (security)")
+@_test_case("Reject compression pointer that jumps forward (security)")
 def test_reject_forward_pointer():
     data = bytearray(64)
     data[0] = 0x03
@@ -114,7 +120,7 @@ def test_reject_forward_pointer():
         pass
 
 
-@test("Reject infinite pointer loop (security)")
+@_test_case("Reject infinite pointer loop (security)")
 def test_reject_pointer_loop():
     data = bytearray(100)
     data[0] = 0xC0
@@ -128,7 +134,7 @@ def test_reject_pointer_loop():
         pass
 
 
-@test("Reject too many pointer jumps (security)")
+@_test_case("Reject too many pointer jumps (security)")
 def test_reject_too_many_jumps():
     n = MAX_POINTER_JUMPS + 5
     data = bytearray(n * 2 + 8)
@@ -148,7 +154,7 @@ def test_reject_too_many_jumps():
         pass
 
 
-@test("Reject label exceeding 63 bytes (security)")
+@_test_case("Reject label exceeding 63 bytes (security)")
 def test_reject_oversized_label():
     length_byte = MAX_LABEL_LENGTH + 1
     label_content = b"a" * (MAX_LABEL_LENGTH + 1)
@@ -160,7 +166,7 @@ def test_reject_oversized_label():
         pass
 
 
-@test("Reject domain name exceeding 255 bytes (security)")
+@_test_case("Reject domain name exceeding 255 bytes (security)")
 def test_reject_oversized_domain():
     parts = []
     for i in range(30):
@@ -174,7 +180,7 @@ def test_reject_oversized_domain():
         pass
 
 
-@test("Reject RR with oversized RDLENGTH (security)")
+@_test_case("Reject RR with oversized RDLENGTH (security)")
 def test_reject_oversized_rdata():
     data = bytearray(200)
     data[0] = 0x00
@@ -188,7 +194,7 @@ def test_reject_oversized_rdata():
         pass
 
 
-@test("Encode/decode domain round-trip")
+@_test_case("Encode/decode domain round-trip")
 def test_encode_decode_domain():
     for name in ["example.com", "www.sub.example.com.", "a.b.c.d.e.f"]:
         encoded, _ = encode_domain_name(name, allow_compression=False)
@@ -197,7 +203,7 @@ def test_encode_decode_domain():
         assert decoded == expected, f"Round-trip failed: '{name}' -> '{decoded}'"
 
 
-@test("DNS message pack/unpack round-trip")
+@_test_case("DNS message pack/unpack round-trip")
 def test_message_roundtrip():
     msg = DNSMessage()
     msg.header.id = 0x1234
@@ -228,7 +234,7 @@ def test_message_roundtrip():
     assert unpacked.answers[0].ttl == 300
 
 
-@test("Parse AAAA record correctly")
+@_test_case("Parse AAAA record correctly")
 def test_parse_aaaa():
     rr = DNSResourceRecord.create_aaaa("ipv6.test", "2001:db8::1", ttl=600)
     parsed = rr.parse_rdata()
@@ -236,21 +242,21 @@ def test_parse_aaaa():
     assert "2001" in parsed and "0db8" in parsed
 
 
-@test("Parse CNAME record correctly")
+@_test_case("Parse CNAME record correctly")
 def test_parse_cname():
     rr = DNSResourceRecord.create_cname("alias.test", "target.test", ttl=300)
     parsed = rr.parse_rdata()
     assert parsed == "target.test"
 
 
-@test("Parse MX record correctly")
+@_test_case("Parse MX record correctly")
 def test_parse_mx():
     rr = DNSResourceRecord.create_mx("test", 10, "mail.test", ttl=300)
     parsed = rr.parse_rdata()
     assert parsed == (10, "mail.test")
 
 
-@test("Domain compression during encoding")
+@_test_case("Domain compression during encoding")
 def test_domain_compression_encoding():
     names = ["example.com", "www.example.com", "mail.example.com"]
     compression_map = {}
@@ -268,7 +274,7 @@ def test_domain_compression_encoding():
 # Cache Tests
 # ============================================================
 
-@test("Cache basic get/put")
+@_test_case("Cache basic get/put")
 def test_cache_basic():
     cache = DNSCache()
     rr = DNSResourceRecord.create_a("test.com", "10.0.0.1", ttl=100)
@@ -280,7 +286,7 @@ def test_cache_basic():
     cache.stop()
 
 
-@test("Cache TTL expiration (per record)")
+@_test_case("Cache TTL expiration (per record)")
 def test_cache_ttl_expiration():
     cache = DNSCache()
     rr1 = DNSResourceRecord.create_a("a.test.com", "10.0.0.1", ttl=2)
@@ -304,14 +310,14 @@ def test_cache_ttl_expiration():
     cache.stop()
 
 
-@test("Cache miss for non-existent entry")
+@_test_case("Cache miss for non-existent entry")
 def test_cache_miss():
     cache = DNSCache()
     assert cache.get("nonexistent.com", TYPE_A) is None
     cache.stop()
 
 
-@test("Cache returns TTL adjusted to remaining time")
+@_test_case("Cache returns TTL adjusted to remaining time")
 def test_cache_adjusted_ttl():
     cache = DNSCache()
     rr = DNSResourceRecord.create_a("ttl.test", "1.2.3.4", ttl=100)
@@ -323,7 +329,7 @@ def test_cache_adjusted_ttl():
     cache.stop()
 
 
-@test("Cache case-insensitive lookups")
+@_test_case("Cache case-insensitive lookups")
 def test_cache_case_insensitive():
     cache = DNSCache()
     rr = DNSResourceRecord.create_a("MixedCase.COM", "1.2.3.4", ttl=300)
@@ -333,7 +339,7 @@ def test_cache_case_insensitive():
     cache.stop()
 
 
-@test("Cache follows CNAME chains")
+@_test_case("Cache follows CNAME chains")
 def test_cache_cname_follow():
     cache = DNSCache()
     cache.put([DNSResourceRecord.create_cname("alias.test", "target.test", ttl=300)])
@@ -347,7 +353,7 @@ def test_cache_cname_follow():
     cache.stop()
 
 
-@test("Cache stores all record types independently")
+@_test_case("Cache stores all record types independently")
 def test_cache_independent_types():
     cache = DNSCache()
     cache.put([DNSResourceRecord.create_a("dual.test", "1.1.1.1", ttl=300)])
@@ -364,7 +370,7 @@ def test_cache_independent_types():
 # Singleflight Tests
 # ============================================================
 
-@test("Singleflight basic deduplication")
+@_test_case("Singleflight basic deduplication")
 def test_singleflight_basic():
     sf = Singleflight()
     call_count = [0]
@@ -392,7 +398,7 @@ def test_singleflight_basic():
     assert all(e is None for e in errors)
 
 
-@test("Singleflight different keys don't collide")
+@_test_case("Singleflight different keys don't collide")
 def test_singleflight_different_keys():
     sf = Singleflight()
     call_counts = {"a": [0], "b": [0]}
@@ -423,7 +429,7 @@ def test_singleflight_different_keys():
     assert results["b"] == "B"
 
 
-@test("Singleflight propagates errors")
+@_test_case("Singleflight propagates errors")
 def test_singleflight_errors():
     sf = Singleflight()
 
@@ -449,7 +455,7 @@ def test_singleflight_errors():
     assert all(str(e) == "test error" for e in errors)
 
 
-@test("Singleflight stats tracking")
+@_test_case("Singleflight stats tracking")
 def test_singleflight_stats():
     sf = Singleflight()
     sf.reset_stats()
@@ -473,7 +479,7 @@ def test_singleflight_stats():
 # Authority Zone Tests
 # ============================================================
 
-@test("Authority zone direct A record lookup")
+@_test_case("Authority zone direct A record lookup")
 def test_authority_a_lookup():
     zone = AuthorityZone("test.com")
     zone.add_record("www", "A", "10.0.0.1")
@@ -484,7 +490,7 @@ def test_authority_a_lookup():
     assert records[0].parse_rdata() == "10.0.0.1"
 
 
-@test("Authority zone origin (@) record")
+@_test_case("Authority zone origin (@) record")
 def test_authority_origin():
     zone = AuthorityZone("myzone.com")
     zone.add_record("@", "A", "10.0.0.100")
@@ -494,7 +500,7 @@ def test_authority_origin():
     assert records[0].parse_rdata() == "10.0.0.100"
 
 
-@test("Authority zone CNAME resolution within zone")
+@_test_case("Authority zone CNAME resolution within zone")
 def test_authority_cname_within_zone():
     zone = AuthorityZone("intrazone.com")
     zone.add_record("alias", "CNAME", "target.intrazone.com")
@@ -507,7 +513,7 @@ def test_authority_cname_within_zone():
     assert TYPE_A in types
 
 
-@test("Authority store multi-zone lookup")
+@_test_case("Authority store multi-zone lookup")
 def test_authority_store_multizone():
     store = AuthorityStore()
     z1 = store.create_zone("foo.com")
@@ -521,7 +527,7 @@ def test_authority_store_multizone():
     assert r2[0].parse_rdata() == "2.2.2.2"
 
 
-@test("Authority zone returns no answer for unknown name")
+@_test_case("Authority zone returns no answer for unknown name")
 def test_authority_nxdomain():
     zone = AuthorityZone("known.com")
     records, is_auth, zone_exists = zone.lookup("unknown.known.com", TYPE_A)
@@ -530,7 +536,7 @@ def test_authority_nxdomain():
     assert len(records) == 0
 
 
-@test("Authority MX record")
+@_test_case("Authority MX record")
 def test_authority_mx():
     zone = AuthorityZone("mxzone.com")
     zone.add_record("@", "MX", (10, "mail.mxzone.com"))
@@ -544,7 +550,7 @@ def test_authority_mx():
 # Integration / Server Tests
 # ============================================================
 
-@test("Full server authoritative query")
+@_test_case("Full server authoritative query")
 def test_server_authoritative():
     server = DNSServer(port=5354, allow_recursion=False)
     zone = server.add_authoritative_zone("server.test")
@@ -598,7 +604,7 @@ def test_server_authoritative():
     server.stop()
 
 
-@test("Malformed packet security: truncated header")
+@_test_case("Malformed packet security: truncated header")
 def test_security_truncated_header():
     try:
         DNSMessage.unpack(b"\x00\x00\x01")
@@ -607,7 +613,7 @@ def test_security_truncated_header():
         pass
 
 
-@test("Malformed packet security: garbage data")
+@_test_case("Malformed packet security: garbage data")
 def test_security_garbage():
     garbage = os.urandom(200)
     try:
@@ -616,6 +622,578 @@ def test_security_garbage():
         pass
     except Exception as e:
         assert False, f"Unexpected exception type: {type(e).__name__}"
+
+
+# ============================================================
+# Real-world Scenario Tests
+# ============================================================
+
+@_test_case("RDATA compression pointer: CNAME target via pointer to Question")
+def test_rdata_compression_cname():
+    """
+    Simulate a real DNS response where CNAME RDATA uses a compression
+    pointer (0xc0 0x0c) pointing to the Question section's qname.
+
+    Response structure:
+    - Header (12 bytes)
+    - Question: www.example.com. A IN (offset 12)
+    - Answer: www.example.com. CNAME <pointer to 0x0c>
+
+    The CNAME RDATA is just 2 bytes: \xc0\x0c (pointer to offset 12)
+    Without full message context, this would parse as empty.
+    """
+    header = DNSHeader()
+    header.id = 0x1234
+    header.qr = 1
+    header.rd = 1
+    header.ra = 1
+    header.qdcount = 1
+    header.ancount = 1
+    header.rcode = RCODE_NOERROR
+
+    q = DNSQuestion()
+    q.qname = "www.example.com"
+    q.qtype = TYPE_A
+    q.qclass = CLASS_IN
+
+    cname_rr = DNSResourceRecord()
+    cname_rr.name = "www.example.com"
+    cname_rr.rtype = TYPE_CNAME
+    cname_rr.rclass = CLASS_IN
+    cname_rr.ttl = 300
+    cname_rr.rdata = b"\xc0\x0c"
+
+    msg = DNSMessage()
+    msg.header = header
+    msg.questions.append(q)
+    msg.answers.append(cname_rr)
+
+    packed = msg.pack(max_size=MAX_UDP_PAYLOAD)
+
+    unpacked = DNSMessage.unpack(packed)
+
+    assert unpacked.header.ancount == 1
+    cname_parsed = unpacked.answers[0]
+    assert cname_parsed.rtype == TYPE_CNAME
+
+    target = cname_parsed.parse_rdata()
+    assert target == "www.example.com", (
+        f"CNAME target parsed as '{target}', expected 'www.example.com'. "
+        "Likely RDATA compression pointer not using full message context."
+    )
+
+
+@_test_case("RDATA compression pointer: NS target via pointer to Question")
+def test_rdata_compression_ns():
+    """
+    Simulate a real DNS response where NS RDATA uses a compression
+    pointer pointing to the Question section.
+    """
+    header = DNSHeader()
+    header.id = 0x5678
+    header.qr = 1
+    header.rd = 1
+    header.ra = 1
+    header.qdcount = 1
+    header.ancount = 0
+    header.nscount = 1
+    header.rcode = RCODE_NOERROR
+
+    q = DNSQuestion()
+    q.qname = "example.com"
+    q.qtype = TYPE_NS
+    q.qclass = CLASS_IN
+
+    ns_rr = DNSResourceRecord()
+    ns_rr.name = "example.com"
+    ns_rr.rtype = TYPE_NS
+    ns_rr.rclass = CLASS_IN
+    ns_rr.ttl = 86400
+    ns_rr.rdata = b"\xc0\x0c"
+
+    msg = DNSMessage()
+    msg.header = header
+    msg.questions.append(q)
+    msg.authorities.append(ns_rr)
+
+    packed = msg.pack(max_size=MAX_UDP_PAYLOAD)
+    unpacked = DNSMessage.unpack(packed)
+
+    assert unpacked.header.nscount == 1
+    ns_parsed = unpacked.authorities[0]
+    assert ns_parsed.rtype == TYPE_NS
+
+    target = ns_parsed.parse_rdata()
+    assert target == "example.com", (
+        f"NS target parsed as '{target}', expected 'example.com'. "
+        "RDATA compression pointer parsing failed."
+    )
+
+
+@_test_case("RDATA compression pointer: MX target via pointer")
+def test_rdata_compression_mx():
+    """
+    Simulate a real DNS response where MX exchange uses a compression
+    pointer. MX RDATA format: [2 bytes preference][exchange domain]
+    """
+    header = DNSHeader()
+    header.id = 0x9ABC
+    header.qr = 1
+    header.rd = 1
+    header.ra = 1
+    header.qdcount = 1
+    header.ancount = 1
+    header.rcode = RCODE_NOERROR
+
+    q = DNSQuestion()
+    q.qname = "example.com"
+    q.qtype = TYPE_MX
+    q.qclass = CLASS_IN
+
+    mx_rr = DNSResourceRecord()
+    mx_rr.name = "example.com"
+    mx_rr.rtype = TYPE_MX
+    mx_rr.rclass = CLASS_IN
+    mx_rr.ttl = 3600
+    mx_rr.rdata = struct.pack("!H", 10) + b"\xc0\x0c"
+
+    msg = DNSMessage()
+    msg.header = header
+    msg.questions.append(q)
+    msg.answers.append(mx_rr)
+
+    packed = msg.pack(max_size=MAX_UDP_PAYLOAD)
+    unpacked = DNSMessage.unpack(packed)
+
+    assert unpacked.header.ancount == 1
+    mx_parsed = unpacked.answers[0]
+    assert mx_parsed.rtype == TYPE_MX
+
+    preference, exchange = mx_parsed.parse_rdata()
+    assert preference == 10, f"MX preference {preference} != 10"
+    assert exchange == "example.com", (
+        f"MX exchange parsed as '{exchange}', expected 'example.com'. "
+        "RDATA compression pointer in MX failed."
+    )
+
+
+@_test_case("RDATA compression: multi-record response with mixed pointers")
+def test_rdata_compression_multi_record():
+    """
+    Simulate a realistic response with CNAME chain + A record,
+    both using compression pointers in RDATA.
+    """
+    header = DNSHeader()
+    header.id = 0xDEF0
+    header.qr = 1
+    header.rd = 1
+    header.ra = 1
+    header.qdcount = 1
+    header.ancount = 2
+    header.rcode = RCODE_NOERROR
+
+    q = DNSQuestion()
+    q.qname = "blog.example.com"
+    q.qtype = TYPE_A
+    q.qclass = CLASS_IN
+
+    cname_rr = DNSResourceRecord()
+    cname_rr.name = "blog.example.com"
+    cname_rr.rtype = TYPE_CNAME
+    cname_rr.rclass = CLASS_IN
+    cname_rr.ttl = 300
+    cname_rr.rdata = encode_domain_name("cdn.example.com", allow_compression=False)[0]
+
+    a_rr = DNSResourceRecord()
+    a_rr.name = "cdn.example.com"
+    a_rr.rtype = TYPE_A
+    a_rr.rclass = CLASS_IN
+    a_rr.ttl = 300
+    a_rr.rdata = struct.pack("!BBBB", 10, 0, 0, 1)
+
+    msg = DNSMessage()
+    msg.header = header
+    msg.questions.append(q)
+    msg.answers.append(cname_rr)
+    msg.answers.append(a_rr)
+
+    packed = msg.pack(max_size=MAX_UDP_PAYLOAD)
+    unpacked = DNSMessage.unpack(packed)
+
+    assert unpacked.header.ancount == 2
+
+    cname_target = unpacked.answers[0].parse_rdata()
+    assert cname_target == "cdn.example.com", f"Got '{cname_target}'"
+
+    a_ip = unpacked.answers[1].parse_rdata()
+    assert a_ip == "10.0.0.1", f"Got '{a_ip}'"
+
+
+@_test_case("CNAME chain: full chain returned from resolver")
+def test_cname_chain_full_return():
+    """
+    Test that the resolver returns the full CNAME chain + final answers,
+    not just the final A record.
+    """
+    class MockUpstream:
+        def __init__(self):
+            self.call_count = 0
+
+        def _send_query_upstream(self, name, qtype, timeout=None):
+            self.call_count += 1
+            header = DNSHeader()
+            header.id = 0x1111
+            header.qr = 1
+            header.rd = 1
+            header.ra = 1
+            header.qdcount = 1
+            header.rcode = RCODE_NOERROR
+
+            q = DNSQuestion()
+            q.qname = name
+            q.qtype = qtype
+            q.qclass = CLASS_IN
+
+            msg = DNSMessage()
+            msg.header = header
+            msg.questions.append(q)
+
+            if name == "a.example.com":
+                header.ancount = 1
+                cname = DNSResourceRecord()
+                cname.name = "a.example.com"
+                cname.rtype = TYPE_CNAME
+                cname.rclass = CLASS_IN
+                cname.ttl = 300
+                cname.rdata = encode_domain_name("b.example.com", allow_compression=False)[0]
+                msg.answers.append(cname)
+            elif name == "b.example.com":
+                header.ancount = 1
+                cname = DNSResourceRecord()
+                cname.name = "b.example.com"
+                cname.rtype = TYPE_CNAME
+                cname.rclass = CLASS_IN
+                cname.ttl = 300
+                cname.rdata = encode_domain_name("c.example.com", allow_compression=False)[0]
+                msg.answers.append(cname)
+            elif name == "c.example.com":
+                header.ancount = 1
+                a = DNSResourceRecord()
+                a.name = "c.example.com"
+                a.rtype = TYPE_A
+                a.rclass = CLASS_IN
+                a.ttl = 300
+                a.rdata = struct.pack("!BBBB", 10, 1, 2, 3)
+                msg.answers.append(a)
+
+            return msg
+
+    cache = DNSCache()
+    resolver = DNSResolver(upstream_servers=[("127.0.0.1", 53)], cache=cache)
+    mock = MockUpstream()
+    resolver._send_query_upstream = mock._send_query_upstream
+
+    result = resolver.resolve("a.example.com", TYPE_A)
+
+    assert len(result) >= 3, (
+        f"Expected at least 3 records (2 CNAME + 1 A), got {len(result)}. "
+        "Full CNAME chain not being returned."
+    )
+
+    record_types = [(rr.rtype, rr.name) for rr in result]
+    assert (TYPE_CNAME, "a.example.com") in record_types, (
+        "First CNAME in chain missing from result"
+    )
+    assert (TYPE_CNAME, "b.example.com") in record_types, (
+        "Second CNAME in chain missing from result"
+    )
+    assert (TYPE_A, "c.example.com") in record_types, (
+        "Final A record missing from result"
+    )
+
+    assert mock.call_count == 3, f"Expected 3 upstream calls, got {mock.call_count}"
+
+
+@_test_case("Singleflight: slow upstream, multiple waiters get same result")
+def test_singleflight_slow_upstream():
+    """
+    Test that when the first upstream request is slow, all concurrent
+    waiters get the same result and don't fail prematurely.
+
+    Simulates: upstream deliberately delayed by 3 seconds, 5 concurrent
+    requests all arrive at once. Only one upstream request is made,
+    all 5 waiters get the same answer.
+    """
+    call_count = 0
+    result_value = ("slow_result", None)
+    start_time = None
+
+    def slow_work():
+        nonlocal call_count, start_time
+        call_count += 1
+        start_time = time.time()
+        time.sleep(2.0)
+        return result_value
+
+    sf = Singleflight(default_timeout=10.0)
+    key = ("slow.domain.example", TYPE_A)
+
+    results = []
+    errors = []
+    was_dups = []
+
+    def make_request():
+        r, e, d = sf.do(key, slow_work, timeout=10.0)
+        results.append(r)
+        errors.append(e)
+        was_dups.append(d)
+
+    threads = [threading.Thread(target=make_request) for _ in range(5)]
+    start = time.time()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    total_time = time.time() - start
+
+    assert call_count == 1, (
+        f"Expected only 1 upstream call (dedup), got {call_count}. "
+        "Singleflight not deduplicating properly."
+    )
+
+    assert len(results) == 5
+    for i, r in enumerate(results):
+        assert r == result_value, f"Request {i} got different result"
+        assert errors[i] is None, f"Request {i} had error: {errors[i]}"
+
+    dup_count = sum(1 for d in was_dups if d)
+    assert dup_count == 4, (
+        f"Expected 4 duplicate requests, got {dup_count}. "
+        "Singleflight not marking duplicates correctly."
+    )
+
+    assert total_time >= 1.9 and total_time < 3.0, (
+        f"Expected ~2s total (one slow call), got {total_time:.2f}s. "
+        "Requests may not be waiting properly."
+    )
+
+
+@_test_case("Singleflight: waiters wait even when upstream takes 15s")
+def test_singleflight_very_slow_upstream():
+    """
+    Stress test: upstream takes 15 seconds, waiters must all wait and
+    get the same result. No premature failures.
+    """
+    call_count = 0
+
+    def very_slow_work():
+        nonlocal call_count
+        call_count += 1
+        time.sleep(3.0)
+        return ("delayed_result_15s", None)
+
+    sf = Singleflight(default_timeout=30.0)
+    key = ("very.slow.example", TYPE_A)
+
+    results = []
+    errors = []
+
+    def make_request():
+        r, e, _ = sf.do(key, very_slow_work, timeout=30.0)
+        results.append(r)
+        errors.append(e)
+
+    threads = [threading.Thread(target=make_request) for _ in range(3)]
+    start = time.time()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    total_time = time.time() - start
+
+    assert call_count == 1
+    assert len(results) == 3
+    for e in errors:
+        assert e is None, f"Unexpected error: {e}"
+    for r in results:
+        assert r == ("delayed_result_15s", None), f"Wrong result: {r}"
+    assert total_time >= 2.9 and total_time < 5.0, (
+        f"Expected ~3s, got {total_time:.2f}s"
+    )
+
+
+@_test_case("Concurrent multi-domain query stability")
+def test_concurrent_multi_domain_stability():
+    """
+    Test that concurrent queries for many different domain names
+    all complete successfully without random SERVFAIL.
+
+    Simulates: 50 different domains queried concurrently, 3 requests
+    per domain (150 total requests). All should succeed.
+    """
+    domain_count = 20
+    requests_per_domain = 3
+
+    domains = [f"domain-{i:03d}.example.com" for i in range(domain_count)]
+
+    response_data = {}
+    for i, domain in enumerate(domains):
+        ip = f"10.{(i // 256) % 256}.{i % 256}.1"
+        response_data[domain] = ip
+
+    def mock_send(name, qtype, timeout=None):
+        time.sleep(random.uniform(0.01, 0.05))
+        header = DNSHeader()
+        header.id = random.randint(0, 0xFFFF)
+        header.qr = 1
+        header.rd = 1
+        header.ra = 1
+        header.qdcount = 1
+        header.ancount = 1
+        header.rcode = RCODE_NOERROR
+
+        q = DNSQuestion()
+        q.qname = name
+        q.qtype = qtype
+        q.qclass = CLASS_IN
+
+        a = DNSResourceRecord()
+        a.name = name
+        a.rtype = TYPE_A
+        a.rclass = CLASS_IN
+        a.ttl = 300
+        parts = [int(p) for p in response_data[name].split(".")]
+        a.rdata = struct.pack("!BBBB", *parts)
+
+        msg = DNSMessage()
+        msg.header = header
+        msg.questions.append(q)
+        msg.answers.append(a)
+        return msg
+
+    cache = DNSCache()
+    resolver = DNSResolver(upstream_servers=[("127.0.0.1", 53)], cache=cache)
+    resolver._send_query_upstream = mock_send
+
+    all_requests = []
+    for domain in domains:
+        for _ in range(requests_per_domain):
+            all_requests.append(domain)
+    random.shuffle(all_requests)
+
+    results = {}
+    errors = []
+
+    def query_domain(domain):
+        try:
+            rrs = resolver.resolve(domain, TYPE_A)
+            results[domain] = rrs
+        except Exception as e:
+            errors.append((domain, e))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
+        futures = [executor.submit(query_domain, d) for d in all_requests]
+        for f in concurrent.futures.as_completed(futures):
+            f.result()
+
+    assert len(errors) == 0, (
+        f"{len(errors)} requests failed out of {len(all_requests)}. "
+        f"Failures: {errors[:5]}"
+    )
+
+    assert len(results) == domain_count, (
+        f"Expected {domain_count} unique domains, got {len(results)}"
+    )
+
+    for domain in domains:
+        assert domain in results, f"Domain {domain} missing from results"
+        rrs = results[domain]
+        assert len(rrs) >= 1, f"No records for {domain}"
+        a_rr = [rr for rr in rrs if rr.rtype == TYPE_A][0]
+        ip = a_rr.parse_rdata()
+        assert ip == response_data[domain], (
+            f"Wrong IP for {domain}: got {ip}, expected {response_data[domain]}"
+        )
+
+    stats = resolver.stats()
+    assert stats["singleflight"]["total_requests"] == len(all_requests)
+    dedup_rate = stats["singleflight"]["saved_percent"]
+    expected_dedup = (
+        (len(all_requests) - domain_count) / len(all_requests) * 100
+    )
+    assert abs(dedup_rate - expected_dedup) < 1.0, (
+        f"Dedup rate {dedup_rate:.1f}% doesn't match expected {expected_dedup:.1f}%"
+    )
+
+
+@_test_case("Resolver: cached CNAME chain returns all records")
+def test_resolver_cached_cname_chain():
+    """
+    Test that after a CNAME chain is cached, subsequent lookups
+    return the full chain from cache, not just the final answer.
+    """
+    call_count = 0
+
+    def mock_send(name, qtype, timeout=None):
+        nonlocal call_count
+        call_count += 1
+        header = DNSHeader()
+        header.id = 0x2222
+        header.qr = 1
+        header.rd = 1
+        header.ra = 1
+        header.qdcount = 1
+        header.ancount = 2
+        header.rcode = RCODE_NOERROR
+
+        q = DNSQuestion()
+        q.qname = name
+        q.qtype = qtype
+        q.qclass = CLASS_IN
+
+        cname = DNSResourceRecord()
+        cname.name = "alias.example.com"
+        cname.rtype = TYPE_CNAME
+        cname.rclass = CLASS_IN
+        cname.ttl = 300
+        cname.rdata = encode_domain_name("final.example.com", allow_compression=False)[0]
+
+        a = DNSResourceRecord()
+        a.name = "final.example.com"
+        a.rtype = TYPE_A
+        a.rclass = CLASS_IN
+        a.ttl = 300
+        a.rdata = struct.pack("!BBBB", 10, 99, 99, 99)
+
+        msg = DNSMessage()
+        msg.header = header
+        msg.questions.append(q)
+        msg.answers.append(cname)
+        msg.answers.append(a)
+        return msg
+
+    cache = DNSCache()
+    resolver = DNSResolver(upstream_servers=[("127.0.0.1", 53)], cache=cache)
+    resolver._send_query_upstream = mock_send
+
+    result1 = resolver.resolve("alias.example.com", TYPE_A)
+    assert call_count == 1
+    assert len(result1) >= 2
+
+    cache_stats = cache.stats()
+    assert cache_stats["entries"] >= 2
+
+    result2 = resolver.resolve("alias.example.com", TYPE_A)
+    assert call_count == 1, "Should not have called upstream again (cached)"
+
+    assert len(result2) >= 2, (
+        f"Cached lookup returned {len(result2)} records, expected >=2. "
+        "Full CNAME chain not being returned from cache."
+    )
+
+    types = [rr.rtype for rr in result2]
+    assert TYPE_CNAME in types, "Cached result missing CNAME record"
+    assert TYPE_A in types, "Cached result missing A record"
 
 
 def run_all_tests():
@@ -666,6 +1244,17 @@ def run_all_tests():
     test_server_authoritative()
     test_security_truncated_header()
     test_security_garbage()
+
+    print("\n--- Real-world Scenario Tests ---")
+    test_rdata_compression_cname()
+    test_rdata_compression_ns()
+    test_rdata_compression_mx()
+    test_rdata_compression_multi_record()
+    test_cname_chain_full_return()
+    test_singleflight_slow_upstream()
+    test_singleflight_very_slow_upstream()
+    test_concurrent_multi_domain_stability()
+    test_resolver_cached_cname_chain()
 
     print("\n" + "=" * 60)
     print(f"Results: {_passed} passed, {_failed} failed")
