@@ -28,7 +28,7 @@ from dns_message import (
     type_to_str,
 )
 from dns_cache import DNSCache
-from dns_resolver import DNSResolver
+from dns_resolver import DNSResolver, ResolveError
 from dns_authority import AuthorityStore
 
 
@@ -152,8 +152,9 @@ class DNSServer:
             if resolved:
                 response.answers = resolved
                 response.header.ancount = len(response.answers)
-            else:
-                pass
+        except ResolveError as e:
+            logger.debug("Resolve error for %s: %s", qname, e)
+            response.header.rcode = e.rcode
         except DNSSecurityError as e:
             logger.warning("Security error resolving %s: %s", qname, e)
             response.header.rcode = RCODE_SERVFAIL
@@ -203,7 +204,19 @@ class DNSServer:
 
         try:
             response = self._handle_query(query, addr, "udp")
-            response_data = response.pack(max_size=MAX_UDP_PAYLOAD)
+            max_size = MAX_UDP_PAYLOAD
+            for rr in query.additionals:
+                if rr.rtype == TYPE_OPT:
+                    max_size = max(MAX_UDP_PAYLOAD, rr.rclass)
+                    opt_rr = DNSResourceRecord()
+                    opt_rr.name = ""
+                    opt_rr.rtype = TYPE_OPT
+                    opt_rr.rclass = min(max_size, MAX_EDNS_PAYLOAD)
+                    opt_rr.ttl = 0
+                    opt_rr.rdata = b""
+                    response.additionals.append(opt_rr)
+                    break
+            response_data = response.pack(max_size=max_size)
             self._udp_socket.sendto(response_data, addr)
         except Exception as e:
             logger.error("Error handling UDP query from %s: %s", addr, e)

@@ -52,7 +52,9 @@ logger = logging.getLogger("dns.resolver")
 
 
 class ResolveError(Exception):
-    pass
+    def __init__(self, message, rcode=RCODE_SERVFAIL):
+        super().__init__(message)
+        self.rcode = rcode
 
 
 class DNSResolver:
@@ -316,7 +318,7 @@ class DNSResolver:
         for depth in range(MAX_CNAME_CHAIN):
             current_name_lower = current_name.lower()
             if current_name_lower in visited_cnames:
-                raise ResolveError("CNAME loop detected")
+                raise ResolveError("CNAME loop detected", RCODE_SERVFAIL)
             visited_cnames.add(current_name_lower)
 
             negative = self.cache.get_negative(current_name, qtype)
@@ -327,7 +329,7 @@ class DNSResolver:
                     self._inc_stat("nxdomain_count")
                 elif rcode == RCODE_SERVFAIL:
                     self._inc_stat("servfail_count")
-                raise ResolveError(f"Negative cache hit: rcode={rcode}")
+                raise ResolveError(f"Negative cache hit: rcode={rcode}", rcode)
 
             response, _ = self._query_upstream(current_name, qtype)
             last_response = response
@@ -338,12 +340,13 @@ class DNSResolver:
 
             if response.header.rcode == RCODE_NXDOMAIN:
                 self._inc_stat("nxdomain_count")
-                return full_chain, response
+                raise ResolveError("NXDOMAIN from upstream", RCODE_NXDOMAIN)
 
             if response.header.rcode != RCODE_NOERROR:
                 self._inc_stat("servfail_count")
                 raise ResolveError(
-                    f"Upstream returned rcode {response.header.rcode}"
+                    f"Upstream returned rcode {response.header.rcode}",
+                    response.header.rcode,
                 )
 
             direct_answers = [
@@ -365,6 +368,40 @@ class DNSResolver:
                 try:
                     target = cname_rr.parse_rdata()
                     if target:
+                        target_lower = target.lower()
+                        chain_target = target_lower
+                        chain_visited = {current_name_lower}
+                        found_in_response = False
+                        for _ in range(MAX_CNAME_CHAIN):
+                            if chain_target in chain_visited:
+                                break
+                            chain_visited.add(chain_target)
+                            final_answers = [
+                                rr for rr in response.answers
+                                if rr.rtype == qtype and rr.name.lower() == chain_target
+                            ]
+                            if final_answers:
+                                full_chain.extend(final_answers)
+                                found_in_response = True
+                                break
+                            next_cname = [
+                                rr for rr in response.answers
+                                if rr.rtype == TYPE_CNAME and rr.name.lower() == chain_target
+                            ]
+                            if next_cname:
+                                nc = next_cname[0]
+                                full_chain.append(nc)
+                                self._inc_stat("cname_followed")
+                                try:
+                                    nt = nc.parse_rdata()
+                                    if nt:
+                                        chain_target = nt.lower()
+                                        continue
+                                except Exception:
+                                    pass
+                            break
+                        if found_in_response:
+                            break
                         current_name = target
                         continue
                 except Exception:
@@ -400,10 +437,10 @@ class DNSResolver:
             self._inc_stat("negative_cache_hits")
             if rcode == RCODE_NXDOMAIN:
                 self._inc_stat("nxdomain_count")
-                raise ResolveError("NXDOMAIN (negative cache)")
+                raise ResolveError("NXDOMAIN (negative cache)", RCODE_NXDOMAIN)
             elif rcode == RCODE_SERVFAIL:
                 self._inc_stat("servfail_count")
-                raise ResolveError("SERVFAIL (negative cache)")
+                raise ResolveError("SERVFAIL (negative cache)", RCODE_SERVFAIL)
 
         cached, cname_chain, complete = self.cache.get_with_cname_follow(name, qtype)
         if complete and cached:
