@@ -47,6 +47,11 @@ MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 0.5
 TCP_TIMEOUT = 10.0
 
+MAX_HEALTHY_FAILURES = 2
+MAX_DEGRADED_FAILURES = 5
+HEALTH_RECOVERY_INTERVAL = 30
+HEALTH_DECAY_INTERVAL = 10
+
 
 logger = logging.getLogger("dns.resolver")
 
@@ -55,6 +60,91 @@ class ResolveError(Exception):
     def __init__(self, message, rcode=RCODE_SERVFAIL):
         super().__init__(message)
         self.rcode = rcode
+
+
+HEALTH_HEALTHY = "healthy"
+HEALTH_DEGRADED = "degraded"
+HEALTH_SICK = "sick"
+
+
+class UpstreamHealth:
+    """Track health status of a single upstream server."""
+
+    __slots__ = (
+        "server",
+        "status",
+        "consecutive_failures",
+        "total_failures",
+        "total_successes",
+        "last_success",
+        "last_failure",
+        "last_status_change",
+        "total_latency",
+        "latency_count",
+    )
+
+    def __init__(self, server):
+        self.server = server
+        self.status = HEALTH_HEALTHY
+        self.consecutive_failures = 0
+        self.total_failures = 0
+        self.total_successes = 0
+        self.last_success = 0.0
+        self.last_failure = 0.0
+        self.last_status_change = time.time()
+        self.total_latency = 0.0
+        self.latency_count = 0
+
+    def record_success(self, latency=0.0):
+        """Record a successful query."""
+        now = time.time()
+        self.consecutive_failures = 0
+        self.total_successes += 1
+        self.last_success = now
+        self.total_latency += latency
+        self.latency_count += 1
+
+        if self.status != HEALTH_HEALTHY:
+            time_since_change = now - self.last_status_change
+            if time_since_change >= HEALTH_RECOVERY_INTERVAL:
+                if self.status == HEALTH_SICK:
+                    self.status = HEALTH_DEGRADED
+                    self.last_status_change = now
+                    logger.info("Upstream %s recovered to degraded", self.server)
+                elif self.status == HEALTH_DEGRADED:
+                    self.status = HEALTH_HEALTHY
+                    self.last_status_change = now
+                    logger.info("Upstream %s fully recovered", self.server)
+
+    def record_failure(self):
+        """Record a failed query."""
+        now = time.time()
+        self.consecutive_failures += 1
+        self.total_failures += 1
+        self.last_failure = now
+
+        if self.status == HEALTH_HEALTHY and self.consecutive_failures >= MAX_HEALTHY_FAILURES:
+            self.status = HEALTH_DEGRADED
+            self.last_status_change = now
+            logger.warning("Upstream %s degraded (%d consecutive failures)", self.server, self.consecutive_failures)
+        elif self.status == HEALTH_DEGRADED and self.consecutive_failures >= MAX_DEGRADED_FAILURES:
+            self.status = HEALTH_SICK
+            self.last_status_change = now
+            logger.warning("Upstream %s marked sick (%d consecutive failures)", self.server, self.consecutive_failures)
+
+    def avg_latency_ms(self):
+        if self.latency_count > 0:
+            return int(self.total_latency / self.latency_count * 1000)
+        return 0
+
+    def weight(self):
+        """Return selection weight based on health status."""
+        if self.status == HEALTH_HEALTHY:
+            return 10
+        elif self.status == HEALTH_DEGRADED:
+            return 3
+        else:
+            return 1
 
 
 class DNSResolver:
@@ -79,8 +169,11 @@ class DNSResolver:
         self.cache = cache if cache is not None else DNSCache()
         self.singleflight = Singleflight(default_timeout=TOTAL_RESOLVE_TIMEOUT)
         self._lock = threading.Lock()
-        self._server_rotation = 0
-        self._rotation_lock = threading.Lock()
+
+        self._upstream_health = {}
+        for server in upstream_servers:
+            self._upstream_health[server] = UpstreamHealth(server)
+        self._health_lock = threading.Lock()
 
         self._stats = {
             "total_queries": 0,
@@ -96,6 +189,7 @@ class DNSResolver:
             "upstream_time_count": 0,
             "retries_total": 0,
             "truncated_count": 0,
+            "upstream_failures": 0,
         }
         self._stats_lock = threading.Lock()
 
@@ -103,12 +197,69 @@ class DNSResolver:
         with self._stats_lock:
             self._stats[key] = self._stats.get(key, 0) + value
 
-    def _get_next_server(self):
-        """Round-robin server selection."""
-        with self._rotation_lock:
-            idx = self._server_rotation % len(self.upstream_servers)
-            self._server_rotation += 1
-            return self.upstream_servers[idx]
+    def _get_next_server(self, exclude=None):
+        """
+        Select the next upstream server using weighted round-robin based on health.
+
+        Args:
+            exclude: set of servers to exclude from selection
+
+        Returns:
+            (server, weight) tuple
+        """
+        if exclude is None:
+            exclude = set()
+
+        with self._health_lock:
+            candidates = []
+            for server in self.upstream_servers:
+                if server in exclude:
+                    continue
+                health = self._upstream_health.get(server)
+                if health is None:
+                    continue
+                weight = health.weight()
+                candidates.extend([server] * weight)
+
+            if not candidates:
+                candidates = [s for s in self.upstream_servers if s not in exclude]
+                if not candidates:
+                    candidates = list(self.upstream_servers)
+
+            idx = random.randint(0, len(candidates) - 1)
+            return candidates[idx]
+
+    def _record_upstream_success(self, server, latency=0.0):
+        """Record a successful query to an upstream server."""
+        with self._health_lock:
+            health = self._upstream_health.get(server)
+            if health:
+                health.record_success(latency)
+
+    def _record_upstream_failure(self, server):
+        """Record a failed query to an upstream server."""
+        with self._health_lock:
+            health = self._upstream_health.get(server)
+            if health:
+                health.record_failure()
+        self._inc_stat("upstream_failures")
+
+    def upstream_health_status(self):
+        """Return health status of all upstream servers."""
+        with self._health_lock:
+            result = {}
+            for server in self.upstream_servers:
+                health = self._upstream_health.get(server)
+                if health:
+                    result[server] = {
+                        "status": health.status,
+                        "consecutive_failures": health.consecutive_failures,
+                        "total_successes": health.total_successes,
+                        "total_failures": health.total_failures,
+                        "avg_latency_ms": health.avg_latency_ms(),
+                        "weight": health.weight(),
+                    }
+            return result
 
     def _build_query(self, name, qtype, id=None, edns=True):
         """Build a DNS query message."""
@@ -223,7 +374,7 @@ class DNSResolver:
         """
         Send a DNS query to upstream servers with retries.
 
-        Tries each server with retries and exponential backoff.
+        Uses health-weighted server selection.
         Falls back to TCP if UDP returns truncated response.
 
         Returns (response, used_tcp) or raises ResolveError.
@@ -233,11 +384,16 @@ class DNSResolver:
         query_data = query.pack(max_size=MAX_MESSAGE_SIZE)
 
         last_error = None
-        servers = list(self.upstream_servers)
-        random.shuffle(servers)
 
         for attempt in range(MAX_RETRIES):
-            for server in servers:
+            tried_servers = set()
+
+            for _ in range(len(self.upstream_servers)):
+                server = self._get_next_server(exclude=tried_servers)
+                if server is None or server in tried_servers:
+                    break
+                tried_servers.add(server)
+
                 start = time.time()
 
                 if use_tcp:
@@ -251,11 +407,13 @@ class DNSResolver:
                     )
 
                 if response_data is None:
+                    self._record_upstream_failure(server)
                     last_error = f"No response from {server}"
                     continue
 
                 response = self._validate_response(response_data, query_id)
                 if response is None:
+                    self._record_upstream_failure(server)
                     last_error = f"Invalid response from {server}"
                     continue
 
@@ -263,6 +421,7 @@ class DNSResolver:
                 self._inc_stat("upstream_time_total", elapsed)
                 self._inc_stat("upstream_time_count")
                 self._inc_stat("upstream_queries")
+                self._record_upstream_success(server, elapsed)
 
                 if response.header.tc and not use_tcp:
                     self._inc_stat("truncated_count")
@@ -286,17 +445,21 @@ class DNSResolver:
         )
 
     def _query_upstream_tcp_only(self, name, qtype, timeout):
-        """Try TCP query to all servers, return first success or None."""
+        """Try TCP query to all servers (health-aware), return first success or None."""
         query_id = random.randint(0, 0xFFFF)
         query = self._build_query(name, qtype, id=query_id, edns=False)
         query_data = query.pack(max_size=MAX_MESSAGE_SIZE)
 
-        servers = list(self.upstream_servers)
-        random.shuffle(servers)
+        tried = set()
+        for _ in range(len(self.upstream_servers)):
+            server = self._get_next_server(exclude=tried)
+            if server is None or server in tried:
+                break
+            tried.add(server)
 
-        for server in servers:
             response_data = self._send_tcp_query(server, query_data, query_id, timeout)
             if response_data is None:
+                self._record_upstream_failure(server)
                 continue
             response = self._validate_response(response_data, query_id)
             if response is not None:
@@ -477,6 +640,7 @@ class DNSResolver:
 
         cache_stats = self.cache.stats()
         sf_stats = self.singleflight.stats()
+        upstream_health = self.upstream_health_status()
 
         if s["upstream_time_count"] > 0:
             s["avg_upstream_latency_ms"] = int(
@@ -485,8 +649,15 @@ class DNSResolver:
         else:
             s["avg_upstream_latency_ms"] = 0
 
+        total = s["total_queries"]
+        if total > 0:
+            s["cache_hit_rate"] = round(s["cache_hits"] / total * 100, 1)
+        else:
+            s["cache_hit_rate"] = 0.0
+
         s["cache"] = cache_stats
         s["singleflight"] = sf_stats
+        s["upstream_health"] = upstream_health
 
         return s
 

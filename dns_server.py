@@ -1,4 +1,5 @@
 import socket
+import struct
 import threading
 import logging
 import time
@@ -108,8 +109,9 @@ class DNSServer:
         qclass = q.qclass
 
         logger.debug(
-            "Query from %s: %s %s %s",
+            "Query from %s (%s): %s %s %s",
             addr,
+            proto,
             type_to_str(qtype),
             qclass,
             qname,
@@ -250,8 +252,100 @@ class DNSServer:
         finally:
             logger.info("UDP server stopped")
 
+    def _handle_tcp_connection(self, conn, addr):
+        """Handle a single TCP DNS connection."""
+        try:
+            conn.settimeout(10.0)
+
+            length_data = b""
+            while len(length_data) < 2:
+                chunk = conn.recv(2 - len(length_data))
+                if not chunk:
+                    return
+                length_data += chunk
+
+            msg_length = struct.unpack("!H", length_data)[0]
+            if msg_length > MAX_MESSAGE_SIZE or msg_length < 12:
+                logger.warning("Invalid TCP DNS message length from %s: %d", addr, msg_length)
+                return
+
+            query_data = b""
+            while len(query_data) < msg_length:
+                chunk = conn.recv(min(4096, msg_length - len(query_data)))
+                if not chunk:
+                    return
+                query_data += chunk
+
+            if not self._check_rate_limit():
+                return
+
+            try:
+                query = DNSMessage.unpack(query_data)
+            except (DNSSecurityError, DNSParseError) as e:
+                logger.debug("Parse error from %s (TCP): %s", addr, e)
+                resp = DNSMessage()
+                resp.header.id = 0
+                try:
+                    resp.header.id = int.from_bytes(query_data[0:2], "big")
+                except Exception:
+                    pass
+                resp.header.qr = 1
+                resp.header.rcode = RCODE_FORMERR
+                resp_data = resp.pack(max_size=MAX_MESSAGE_SIZE)
+                tcp_resp = struct.pack("!H", len(resp_data)) + resp_data
+                conn.sendall(tcp_resp)
+                return
+
+            try:
+                response = self._handle_query(query, addr, "tcp")
+                response_data = response.pack(max_size=MAX_MESSAGE_SIZE)
+                tcp_response = struct.pack("!H", len(response_data)) + response_data
+                conn.sendall(tcp_response)
+            except Exception as e:
+                logger.error("Error handling TCP query from %s: %s", addr, e)
+        except socket.timeout:
+            logger.debug("TCP connection timeout from %s", addr)
+        except OSError as e:
+            logger.debug("TCP connection error from %s: %s", addr, e)
+        except Exception as e:
+            logger.error("Unexpected TCP error from %s: %s", addr, e)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _tcp_server_loop(self):
+        """TCP server main loop."""
+        logger.info("Starting TCP DNS server on %s:%d", self.host, self.port)
+        try:
+            while self._running:
+                try:
+                    ready, _, _ = select.select(
+                        [self._tcp_socket], [], [], 0.5
+                    )
+                    if not ready:
+                        continue
+                    conn, addr = self._tcp_socket.accept()
+                    t = threading.Thread(
+                        target=self._handle_tcp_connection,
+                        args=(conn, addr),
+                        daemon=True,
+                    )
+                    t.start()
+                except socket.timeout:
+                    continue
+                except OSError as e:
+                    if self._running:
+                        logger.error("TCP socket error: %s", e)
+                    break
+                except Exception as e:
+                    logger.error("TCP loop error: %s", e)
+        finally:
+            logger.info("TCP server stopped")
+
     def start(self):
-        """Start the DNS server (UDP)."""
+        """Start the DNS server (UDP + TCP)."""
         if self._running:
             return
 
@@ -260,14 +354,27 @@ class DNSServer:
         self._udp_socket.bind((self.host, self.port))
         self._udp_socket.settimeout(1.0)
 
+        self._tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._tcp_socket.bind((self.host, self.port))
+        self._tcp_socket.listen(50)
+        self._tcp_socket.settimeout(1.0)
+
         self._running = True
+
         udp_thread = threading.Thread(
             target=self._udp_server_loop, daemon=True, name="dns-udp"
         )
         udp_thread.start()
         self._threads.append(udp_thread)
 
-        logger.info("DNS server started on %s:%d", self.host, self.port)
+        tcp_thread = threading.Thread(
+            target=self._tcp_server_loop, daemon=True, name="dns-tcp"
+        )
+        tcp_thread.start()
+        self._threads.append(tcp_thread)
+
+        logger.info("DNS server started on %s:%d (UDP + TCP)", self.host, self.port)
 
     def stop(self):
         """Stop the DNS server."""
@@ -275,6 +382,11 @@ class DNSServer:
         if self._udp_socket:
             try:
                 self._udp_socket.close()
+            except Exception:
+                pass
+        if self._tcp_socket:
+            try:
+                self._tcp_socket.close()
             except Exception:
                 pass
         for t in self._threads:
@@ -285,3 +397,70 @@ class DNSServer:
 
     def stats(self):
         return self.resolver.stats()
+
+    def print_status(self):
+        """Print a formatted status report to stdout."""
+        s = self.stats()
+
+        lines = []
+        lines.append("=" * 60)
+        lines.append("  DNS Server Status")
+        lines.append("=" * 60)
+
+        lines.append("")
+        lines.append("  Query Statistics")
+        lines.append("  " + "-" * 40)
+        lines.append(f"  Total queries:      {s['total_queries']}")
+        lines.append(f"  NXDOMAIN:           {s['nxdomain_count']}")
+        lines.append(f"  SERVFAIL:           {s['servfail_count']}")
+        lines.append(f"  Retries:            {s['retries_total']}")
+        lines.append(f"  Truncated:          {s['truncated_count']}")
+
+        lines.append("")
+        lines.append("  Cache Statistics")
+        lines.append("  " + "-" * 40)
+        lines.append(f"  Positive entries:   {s['cache']['entries']}")
+        lines.append(f"  Negative entries:   {s['cache']['negative_entries']}")
+        lines.append(f"  Cache hits:         {s['cache']['hits']} ({s['cache_hit_rate']}%)")
+        lines.append(f"  Cache misses:       {s['cache']['misses']}")
+        lines.append(f"  Negative hits:      {s['cache']['negative_hits']}")
+
+        lines.append("")
+        lines.append("  Singleflight")
+        lines.append("  " + "-" * 40)
+        lines.append(f"  Total requests:     {s['singleflight']['total_requests']}")
+        lines.append(f"  Deduped (saved):    {s['singleflight']['deduped_requests']} ({s['singleflight']['saved_percent']:.1f}%)")
+        lines.append(f"  Timeouts:           {s['singleflight']['timeout_count']}")
+
+        lines.append("")
+        lines.append("  Upstream")
+        lines.append("  " + "-" * 40)
+        lines.append(f"  Upstream queries:   {s['upstream_queries']}")
+        lines.append(f"  Avg latency:        {s['avg_upstream_latency_ms']} ms")
+        lines.append(f"  TCP fallbacks:      {s['tcp_fallbacks']}")
+        lines.append(f"  Upstream failures:  {s['upstream_failures']}")
+
+        lines.append("")
+        lines.append("  Upstream Health")
+        lines.append("  " + "-" * 40)
+        for server, health in s["upstream_health"].items():
+            host, port = server
+            status_icon = {
+                "healthy": "  [OK]  ",
+                "degraded": "[WARN] ",
+                "sick":   "[FAIL] ",
+            }.get(health["status"], "  [?]  ")
+            lines.append(
+                f"  {status_icon} {host}:{port:<5} "
+                f"status={health['status']:<10} "
+                f"weight={health['weight']:<2} "
+                f"latency={health['avg_latency_ms']:>4}ms "
+                f"ok={health['total_successes']:<4} "
+                f"fail={health['total_failures']:<4} "
+                f"consec_fail={health['consecutive_failures']}"
+            )
+
+        lines.append("")
+        lines.append("=" * 60)
+
+        print("\n".join(lines))

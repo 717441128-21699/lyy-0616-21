@@ -1,5 +1,7 @@
 import time
 import threading
+import pickle
+import json
 from dns_message import (
     DNSResourceRecord,
     TYPE_A,
@@ -355,3 +357,162 @@ class DNSCache:
             self._misses = 0
             self._negative_hits = 0
             self._negative_stores = 0
+
+    def clear_name(self, name):
+        """Clear all records for a specific domain name (all types)."""
+        name_lower = name.lower()
+        with self._lock:
+            keys_to_remove = [k for k in self._cache if k[0] == name_lower]
+            for k in keys_to_remove:
+                del self._cache[k]
+            neg_keys_to_remove = [k for k in self._negative_cache if k[0] == name_lower]
+            for k in neg_keys_to_remove:
+                del self._negative_cache[k]
+
+    def clear_type(self, name, qtype):
+        """Clear a specific (name, type) entry from cache."""
+        key = self._cache_key(name, qtype)
+        with self._lock:
+            if key in self._cache:
+                del self._cache[key]
+            if key in self._negative_cache:
+                del self._negative_cache[key]
+
+    def export_snapshot(self, path=None):
+        """
+        Export current cache state to a snapshot file.
+
+        Args:
+            path: file path to save. If None, returns the raw bytes.
+
+        Returns:
+            Number of entries exported, or bytes if path is None.
+        """
+        with self._lock:
+            snapshot = {
+                "version": 1,
+                "timestamp": time.time(),
+                "positive": {},
+                "negative": {},
+            }
+            for key, entry in self._cache.items():
+                name, qtype = key
+                records_data = []
+                for rr, expires_at in entry.records:
+                    remaining = int(expires_at - time.time())
+                    if remaining > 0:
+                        records_data.append({
+                            "name": rr.name,
+                            "type": rr.rtype,
+                            "class": rr.rclass,
+                            "ttl": remaining,
+                            "rdata": rr.rdata.hex(),
+                        })
+                if records_data:
+                    snapshot["positive"][f"{name}:{qtype}"] = records_data
+
+            for key, entry in self._negative_cache.items():
+                name, qtype = key
+                remaining = entry.remaining_ttl()
+                if remaining > 0:
+                    snapshot["negative"][f"{name}:{qtype}"] = {
+                        "rcode": entry.rcode,
+                        "ttl": remaining,
+                    }
+
+        if path is None:
+            return pickle.dumps(snapshot)
+
+        with open(path, "wb") as f:
+            pickle.dump(snapshot, f)
+
+        pos_count = len(snapshot["positive"])
+        neg_count = len(snapshot["negative"])
+        return pos_count + neg_count
+
+    def import_snapshot(self, data=None, path=None, max_ttl=None, min_ttl=60):
+        """
+        Import cache from a snapshot.
+
+        Args:
+            data: raw bytes from export_snapshot
+            path: file path to load from (used if data is None)
+            max_ttl: cap imported TTLs to this value (seconds)
+            min_ttl: minimum TTL for imported records (seconds)
+
+        Returns:
+            (positive_imported, negative_imported) counts
+        """
+        if data is None and path is not None:
+            with open(path, "rb") as f:
+                data = f.read()
+
+        if data is None:
+            return 0, 0
+
+        try:
+            snapshot = pickle.loads(data)
+        except Exception:
+            return 0, 0
+
+        if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
+            return 0, 0
+
+        pos_count = 0
+        neg_count = 0
+
+        with self._lock:
+            for key_str, records_data in snapshot.get("positive", {}).items():
+                try:
+                    name, qtype_str = key_str.rsplit(":", 1)
+                    qtype = int(qtype_str)
+                except ValueError:
+                    continue
+
+                for rd in records_data:
+                    try:
+                        ttl = int(rd.get("ttl", 0))
+                        if max_ttl is not None:
+                            ttl = min(ttl, max_ttl)
+                        ttl = max(ttl, min_ttl)
+
+                        rr = DNSResourceRecord()
+                        rr.name = rd["name"]
+                        rr.rtype = qtype
+                        rr.rclass = int(rd.get("class", 1))
+                        rr.ttl = ttl
+                        rr.rdata = bytes.fromhex(rd["rdata"])
+                        self.put([rr])
+                        pos_count += 1
+                    except Exception:
+                        continue
+
+            for key_str, neg_data in snapshot.get("negative", {}).items():
+                try:
+                    name, qtype_str = key_str.rsplit(":", 1)
+                    qtype = int(qtype_str)
+                except ValueError:
+                    continue
+
+                try:
+                    ttl = int(neg_data.get("ttl", 0))
+                    if max_ttl is not None:
+                        ttl = min(ttl, max_ttl)
+                    ttl = max(ttl, min_ttl)
+                    rcode = neg_data.get("rcode", RCODE_SERVFAIL)
+                    self.put_negative(name, qtype, rcode, ttl)
+                    neg_count += 1
+                except Exception:
+                    continue
+
+        return pos_count, neg_count
+
+    def list_domains(self, limit=100):
+        """List cached domain names (for diagnostic purposes)."""
+        with self._lock:
+            names = set()
+            for (name, _) in self._cache.keys():
+                names.add(name)
+                if len(names) >= limit:
+                    break
+            return sorted(list(names))[:limit]

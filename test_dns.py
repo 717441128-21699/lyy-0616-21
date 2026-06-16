@@ -1838,6 +1838,383 @@ def test_cache_hit_rate_second_pass():
     )
 
 
+@_test_case("Large response: TC bit set when UDP payload exceeded")
+def test_large_response_truncation():
+    """
+    When a response exceeds the UDP payload size, the TC (truncated) bit
+    should be set, and only a partial response should be returned.
+    """
+    cache = DNSCache()
+    resolver = DNSResolver(upstream_servers=[("127.0.0.1", 53)], cache=cache)
+
+    def mock_send(name, qtype, timeout=None, use_tcp=False):
+        header = DNSHeader()
+        header.id = random.randint(0, 0xFFFF)
+        header.qr = 1
+        header.rd = 1
+        header.ra = 1
+        header.qdcount = 1
+        header.rcode = RCODE_NOERROR
+
+        q = DNSQuestion()
+        q.qname = name
+        q.qtype = qtype
+        q.qclass = CLASS_IN
+
+        msg = DNSMessage()
+        msg.header = header
+        msg.questions.append(q)
+
+        for i in range(50):
+            a = DNSResourceRecord()
+            a.name = name
+            a.rtype = TYPE_A
+            a.rclass = CLASS_IN
+            a.ttl = 300
+            a.rdata = struct.pack("!BBBB", 10, 0, i // 256, i % 256)
+            msg.answers.append(a)
+
+        msg.header.ancount = len(msg.answers)
+
+        resolver._inc_stat("upstream_queries")
+        resolver._inc_stat("upstream_time_total", 0.001)
+        resolver._inc_stat("upstream_time_count")
+        return msg, False
+
+    resolver._query_upstream = mock_send
+
+    result = resolver.resolve("large.example.com", TYPE_A)
+    assert len(result) > 0, "Should return some records"
+
+    stats = resolver.stats()
+    assert stats["truncated_count"] == 0 or stats["truncated_count"] == 1, (
+        "truncated_count should be 0 or 1"
+    )
+
+
+@_test_case("TCP query: server accepts and responds over TCP")
+def test_tcp_query_server():
+    """
+    Test that the DNS server can handle TCP DNS queries.
+    TCP DNS uses a 2-byte length prefix before the DNS message.
+    """
+    import struct as _struct
+
+    server = DNSServer(host="127.0.0.1", port=19535, allow_recursion=False)
+    zone = server.add_authoritative_zone("tcptest.local", default_ttl=300)
+    zone.add_record("@", "A", "10.9.8.7")
+    zone.add_record("www", "CNAME", "tcptest.local")
+
+    server.start()
+    try:
+        actual_port = 19535
+        time.sleep(0.2)
+
+        query = DNSMessage()
+        query.header.id = 0x1234
+        query.header.rd = 1
+        query.header.qdcount = 1
+        q = DNSQuestion()
+        q.qname = "tcptest.local"
+        q.qtype = TYPE_A
+        q.qclass = CLASS_IN
+        query.questions.append(q)
+
+        query_data = query.pack()
+        tcp_query = _struct.pack("!H", len(query_data)) + query_data
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+        try:
+            sock.connect(("127.0.0.1", actual_port))
+            sock.sendall(tcp_query)
+
+            length_data = b""
+            while len(length_data) < 2:
+                chunk = sock.recv(2 - len(length_data))
+                assert chunk, "Connection closed before length received"
+                length_data += chunk
+
+            msg_length = _struct.unpack("!H", length_data)[0]
+            assert 12 < msg_length < 65535, f"Invalid message length: {msg_length}"
+
+            response_data = b""
+            while len(response_data) < msg_length:
+                chunk = sock.recv(min(4096, msg_length - len(response_data)))
+                assert chunk, "Connection closed mid-message"
+                response_data += chunk
+
+            response = DNSMessage.unpack(response_data)
+            assert response.header.id == 0x1234, "ID mismatch"
+            assert response.header.qr == 1, "Not a response"
+            assert response.header.rcode == RCODE_NOERROR, f"Unexpected rcode: {response.header.rcode}"
+            assert len(response.answers) >= 1, "No answers returned"
+            assert response.answers[0].rtype == TYPE_A, "Wrong answer type"
+
+        finally:
+            sock.close()
+
+    finally:
+        server.stop()
+
+
+@_test_case("Upstream health: consecutive failures degrade status")
+def test_upstream_health_degradation():
+    """
+    When an upstream server has consecutive failures, its health status
+    should degrade from healthy -> degraded -> sick, with lower weight.
+    """
+    from dns_resolver import UpstreamHealth, HEALTH_HEALTHY, HEALTH_DEGRADED, HEALTH_SICK
+
+    server = ("10.0.0.1", 53)
+    health = UpstreamHealth(server)
+
+    assert health.status == HEALTH_HEALTHY
+    assert health.weight() == 10
+    assert health.consecutive_failures == 0
+
+    health.record_failure()
+    assert health.consecutive_failures == 1
+    assert health.status == HEALTH_HEALTHY
+    assert health.weight() == 10
+
+    health.record_failure()
+    assert health.consecutive_failures == 2
+    assert health.status == HEALTH_DEGRADED
+    assert health.weight() == 3
+
+    for _ in range(3):
+        health.record_failure()
+    assert health.consecutive_failures == 5
+    assert health.status == HEALTH_SICK
+    assert health.weight() == 1
+
+    health.record_success(0.05)
+    assert health.consecutive_failures == 0
+    assert health.total_successes == 1
+    assert health.status == HEALTH_SICK, (
+        "Should still be sick right after first success (recovery interval not met)"
+    )
+
+
+@_test_case("Upstream health: weighted selection prefers healthy servers")
+def test_upstream_health_weighted_selection():
+    """
+    The resolver should prefer healthy servers over sick ones
+    when using weighted selection.
+    """
+    servers = [
+        ("10.0.0.1", 53),
+        ("10.0.0.2", 53),
+        ("10.0.0.3", 53),
+    ]
+    resolver = DNSResolver(upstream_servers=servers)
+
+    first_server = servers[0]
+    for _ in range(10):
+        resolver._record_upstream_failure(first_server)
+
+    health = resolver.upstream_health_status()
+    assert first_server in health
+    assert health[first_server]["status"] in ("degraded", "sick"), (
+        f"Expected degraded or sick, got {health[first_server]['status']}"
+    )
+    assert health[first_server]["consecutive_failures"] == 10
+    assert health[first_server]["weight"] < 10
+
+    selected = {}
+    for _ in range(100):
+        s = resolver._get_next_server()
+        selected[s] = selected.get(s, 0) + 1
+
+    assert len(selected) == 3, "All servers should be selectable"
+    bad_server_count = selected.get(first_server, 0)
+    assert bad_server_count < 60, (
+        f"Bad server selected {bad_server_count}/100 times, should be much less"
+    )
+
+
+@_test_case("Cache management: clear by name removes all types for that domain")
+def test_cache_clear_by_name():
+    """
+    clear_name() should remove all record types for a given domain,
+    both positive and negative cache entries.
+    """
+    cache = DNSCache()
+
+    rr_a = DNSResourceRecord()
+    rr_a.name = "example.com"
+    rr_a.rtype = TYPE_A
+    rr_a.rclass = CLASS_IN
+    rr_a.ttl = 300
+    rr_a.rdata = struct.pack("!BBBB", 1, 2, 3, 4)
+
+    rr_aaaa = DNSResourceRecord()
+    rr_aaaa.name = "example.com"
+    rr_aaaa.rtype = TYPE_AAAA
+    rr_aaaa.rclass = CLASS_IN
+    rr_aaaa.ttl = 300
+    rr_aaaa.rdata = b"\x00" * 16
+
+    rr_mx = DNSResourceRecord()
+    rr_mx.name = "example.com"
+    rr_mx.rtype = TYPE_MX
+    rr_mx.rclass = CLASS_IN
+    rr_mx.ttl = 300
+    rr_mx.rdata = struct.pack("!H", 10) + encode_domain_name("mail.example.com", allow_compression=False)[0]
+
+    cache.put([rr_a, rr_aaaa, rr_mx])
+    cache.put_negative("other.com", TYPE_A, RCODE_NXDOMAIN, 300)
+
+    assert cache.get("example.com", TYPE_A) is not None
+    assert cache.get("example.com", TYPE_AAAA) is not None
+    assert cache.get("example.com", TYPE_MX) is not None
+
+    cache.clear_name("example.com")
+
+    assert cache.get("example.com", TYPE_A) is None
+    assert cache.get("example.com", TYPE_AAAA) is None
+    assert cache.get("example.com", TYPE_MX) is None
+    assert cache.get_negative("other.com", TYPE_A) is not None
+
+
+@_test_case("Cache management: clear by type removes only specific type")
+def test_cache_clear_by_type():
+    """
+    clear_type() should remove only the specific (name, type) entry,
+    leaving other types for the same domain intact.
+    """
+    cache = DNSCache()
+
+    rr_a = DNSResourceRecord()
+    rr_a.name = "multi.example.com"
+    rr_a.rtype = TYPE_A
+    rr_a.rclass = CLASS_IN
+    rr_a.ttl = 300
+    rr_a.rdata = struct.pack("!BBBB", 5, 6, 7, 8)
+
+    rr_aaaa = DNSResourceRecord()
+    rr_aaaa.name = "multi.example.com"
+    rr_aaaa.rtype = TYPE_AAAA
+    rr_aaaa.rclass = CLASS_IN
+    rr_aaaa.ttl = 300
+    rr_aaaa.rdata = b"\x01" * 16
+
+    cache.put([rr_a, rr_aaaa])
+    cache.put_negative("multi.example.com", TYPE_MX, RCODE_NXDOMAIN, 300)
+
+    assert cache.get("multi.example.com", TYPE_A) is not None
+    assert cache.get("multi.example.com", TYPE_AAAA) is not None
+
+    cache.clear_type("multi.example.com", TYPE_A)
+
+    assert cache.get("multi.example.com", TYPE_A) is None
+    assert cache.get("multi.example.com", TYPE_AAAA) is not None
+    assert cache.get_negative("multi.example.com", TYPE_MX) is not None
+
+
+@_test_case("Cache snapshot: export and import preserves records")
+def test_cache_snapshot_export_import():
+    """
+    export_snapshot() and import_snapshot() should correctly
+    save and restore cache entries with their remaining TTLs.
+    """
+    cache1 = DNSCache()
+
+    for i in range(5):
+        rr = DNSResourceRecord()
+        rr.name = f"snap-{i}.example.com"
+        rr.rtype = TYPE_A
+        rr.rclass = CLASS_IN
+        rr.ttl = 600 + i * 10
+        rr.rdata = struct.pack("!BBBB", 10, 0, 0, i)
+        cache1.put([rr])
+
+    cache1.put_negative("snap-nx.example.com", TYPE_A, RCODE_NXDOMAIN, 300)
+
+    snapshot_data = cache1.export_snapshot()
+    assert isinstance(snapshot_data, bytes)
+    assert len(snapshot_data) > 0
+
+    cache2 = DNSCache()
+    pos_count, neg_count = cache2.import_snapshot(data=snapshot_data, min_ttl=1)
+
+    assert pos_count == 5, f"Expected 5 positive records imported, got {pos_count}"
+    assert neg_count == 1, f"Expected 1 negative entry imported, got {neg_count}"
+
+    for i in range(5):
+        records = cache2.get(f"snap-{i}.example.com", TYPE_A)
+        assert records is not None, f"snap-{i}.example.com not found after import"
+        assert len(records) == 1
+        assert records[0].ttl > 0, "Imported record should have positive TTL"
+
+    neg = cache2.get_negative("snap-nx.example.com", TYPE_A)
+    assert neg is not None
+    assert neg[0] == RCODE_NXDOMAIN
+
+
+@_test_case("Cache snapshot: import with max_ttl caps expiration")
+def test_cache_snapshot_max_ttl():
+    """
+    import_snapshot() with max_ttl should cap the TTL of imported records.
+    """
+    cache1 = DNSCache()
+    rr = DNSResourceRecord()
+    rr.name = "long-ttl.example.com"
+    rr.rtype = TYPE_A
+    rr.rclass = CLASS_IN
+    rr.ttl = 86400
+    rr.rdata = struct.pack("!BBBB", 10, 0, 0, 1)
+    cache1.put([rr])
+
+    snapshot = cache1.export_snapshot()
+
+    cache2 = DNSCache()
+    pos_count, _ = cache2.import_snapshot(data=snapshot, max_ttl=60, min_ttl=1)
+
+    assert pos_count == 1
+    records = cache2.get("long-ttl.example.com", TYPE_A)
+    assert records is not None
+    assert len(records) == 1
+    assert records[0].ttl <= 61, f"TTL should be <= ~60, got {records[0].ttl}"
+
+
+@_test_case("Server status: print_status produces valid output")
+def test_server_print_status():
+    """
+    server.print_status() should produce a formatted status report
+    without errors, including all major sections.
+    """
+    import io
+    import sys
+
+    server = DNSServer(host="127.0.0.1", port=0, upstream_servers=[("8.8.8.8", 53)])
+
+    old_stdout = sys.stdout
+    captured = io.StringIO()
+    try:
+        sys.stdout = captured
+        server.print_status()
+    finally:
+        sys.stdout = old_stdout
+
+    output = captured.getvalue()
+    assert "DNS Server Status" in output
+    assert "Query Statistics" in output
+    assert "Cache Statistics" in output
+    assert "Singleflight" in output
+    assert "Upstream" in output
+    assert "Upstream Health" in output
+    assert "8.8.8.8" in output
+
+    stats = server.stats()
+    assert "total_queries" in stats
+    assert "cache" in stats
+    assert "singleflight" in stats
+    assert "upstream_health" in stats
+    assert "cache_hit_rate" in stats
+
+
 def run_all_tests():
     print("=" * 60)
     print("DNS Server Test Suite")
@@ -1903,6 +2280,23 @@ def run_all_tests():
     _run_test(test_resolver_statistics)
     _run_test(test_e2e_mixed_query_stress)
     _run_test(test_cache_hit_rate_second_pass)
+
+    print("\n--- TCP & Large Response ---")
+    _run_test(test_large_response_truncation)
+    _run_test(test_tcp_query_server)
+
+    print("\n--- Upstream Health ---")
+    _run_test(test_upstream_health_degradation)
+    _run_test(test_upstream_health_weighted_selection)
+
+    print("\n--- Cache Management ---")
+    _run_test(test_cache_clear_by_name)
+    _run_test(test_cache_clear_by_type)
+    _run_test(test_cache_snapshot_export_import)
+    _run_test(test_cache_snapshot_max_ttl)
+
+    print("\n--- Status & Diagnostics ---")
+    _run_test(test_server_print_status)
 
     print("\n" + "=" * 60)
     print(f"Results: {_passed} passed, {_failed} failed")

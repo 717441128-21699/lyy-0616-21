@@ -74,6 +74,8 @@ def main():
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     parser.add_argument("--test", action="store_true", help="Run built-in tests")
+    parser.add_argument("--status-interval", type=int, default=0,
+        help="Print status every N seconds while server is running (0 = disable)")
     args = parser.parse_args()
 
     setup_logging(args.verbose)
@@ -103,22 +105,20 @@ def main():
     setup_authoritative_records(server)
     server.start()
 
-    print(f"DNS server listening on {args.host}:{args.port}")
+    print(f"DNS server listening on {args.host}:{args.port} (UDP + TCP)")
     if not args.no_recursion:
         print("Recursive resolution enabled")
     print(f"Authoritative zones: local, example.com")
     print("Press Ctrl+C to stop")
 
     try:
-        while True:
-            time.sleep(10)
-            stats = server.stats()
-            logging.info(
-                "Stats: cache entries=%d, hit_rate=%.1f%%, singleflight saved=%.1f%%",
-                stats["cache"]["entries"],
-                stats["cache"]["hit_rate"],
-                stats["singleflight"]["saved_percent"],
-            )
+        if args.status_interval > 0:
+            while True:
+                time.sleep(args.status_interval)
+                server.print_status()
+        else:
+            while True:
+                time.sleep(3600)
     except KeyboardInterrupt:
         print("\nShutting down...")
         server.stop()
