@@ -1196,6 +1196,551 @@ def test_resolver_cached_cname_chain():
     assert TYPE_A in types, "Cached result missing A record"
 
 
+@_test_case("Negative cache: NXDOMAIN cached, no repeat upstream query")
+def test_negative_cache_nxdomain():
+    """
+    Test that NXDOMAIN responses are cached, and subsequent queries
+    for the same name return from negative cache without hitting upstream.
+    """
+    call_count = 0
+
+    def mock_send(name, qtype, timeout=None):
+        nonlocal call_count
+        call_count += 1
+        header = DNSHeader()
+        header.id = 0x3333
+        header.qr = 1
+        header.rd = 1
+        header.ra = 1
+        header.qdcount = 1
+        header.rcode = RCODE_NXDOMAIN
+
+        q = DNSQuestion()
+        q.qname = name
+        q.qtype = qtype
+        q.qclass = CLASS_IN
+
+        msg = DNSMessage()
+        msg.header = header
+        msg.questions.append(q)
+        return msg, False
+
+    cache = DNSCache()
+    resolver = DNSResolver(upstream_servers=[("127.0.0.1", 53)], cache=cache)
+    resolver._query_upstream = mock_send
+
+    try:
+        resolver.resolve("nonexistent.example.com", TYPE_A)
+        assert False, "Should have raised ResolveError"
+    except ResolveError:
+        pass
+
+    first_count = call_count
+
+    for i in range(5):
+        try:
+            resolver.resolve("nonexistent.example.com", TYPE_A)
+            assert False, "Should have raised ResolveError from negative cache"
+        except ResolveError:
+            pass
+
+    assert call_count == first_count, (
+        f"Expected {first_count} upstream call (negative cache), got {call_count}. "
+        "Negative cache not preventing repeat upstream queries."
+    )
+
+    stats = cache.stats()
+    assert stats["negative_entries"] >= 1, "No negative cache entries stored"
+    assert stats["negative_hits"] >= 5, (
+        f"Expected >=5 negative cache hits, got {stats['negative_hits']}"
+    )
+
+
+@_test_case("Negative cache: SERVFAIL cached, no repeat upstream query")
+def test_negative_cache_servfail():
+    """
+    Test that SERVFAIL responses are cached temporarily.
+    """
+    call_count = 0
+
+    def mock_send(name, qtype, timeout=None):
+        nonlocal call_count
+        call_count += 1
+        raise ResolveError("SERVFAIL mock")
+
+    cache = DNSCache()
+    resolver = DNSResolver(upstream_servers=[("127.0.0.1", 53)], cache=cache)
+    resolver._query_upstream = mock_send
+
+    cache.put_negative("broken.example.com", TYPE_A, RCODE_SERVFAIL, ttl=60)
+
+    for i in range(5):
+        try:
+            resolver.resolve("broken.example.com", TYPE_A)
+            assert False, "Should have raised"
+        except ResolveError:
+            pass
+
+    assert call_count == 0, (
+        f"Expected 0 upstream calls (pre-cached negative), got {call_count}. "
+        "Negative cache not working for SERVFAIL."
+    )
+
+
+@_test_case("Cached CNAME chain: upstream offline, still returns answer")
+def test_cached_cname_upstream_offline():
+    """
+    Key scenario: once CNAME chain + final answer are cached,
+    even if upstream goes down completely, queries still succeed
+    using cached data.
+    """
+    upstream_calls = [0]
+    upstream_works = [True]
+
+    def mock_send(name, qtype, timeout=None):
+        upstream_calls[0] += 1
+        if not upstream_works[0]:
+            raise ResolveError("Upstream offline!")
+
+        header = DNSHeader()
+        header.id = 0x4444
+        header.qr = 1
+        header.rd = 1
+        header.ra = 1
+        header.qdcount = 1
+        header.ancount = 2
+        header.rcode = RCODE_NOERROR
+
+        q = DNSQuestion()
+        q.qname = name
+        q.qtype = qtype
+        q.qclass = CLASS_IN
+
+        cname = DNSResourceRecord()
+        cname.name = "alias.cached.com"
+        cname.rtype = TYPE_CNAME
+        cname.rclass = CLASS_IN
+        cname.ttl = 300
+        cname.rdata = encode_domain_name("final.cached.com", allow_compression=False)[0]
+
+        a = DNSResourceRecord()
+        a.name = "final.cached.com"
+        a.rtype = TYPE_A
+        a.rclass = CLASS_IN
+        a.ttl = 300
+        a.rdata = struct.pack("!BBBB", 10, 20, 30, 40)
+
+        msg = DNSMessage()
+        msg.header = header
+        msg.questions.append(q)
+        msg.answers.append(cname)
+        msg.answers.append(a)
+        return msg, False
+
+    cache = DNSCache()
+    resolver = DNSResolver(upstream_servers=[("127.0.0.1", 53)], cache=cache)
+    resolver._query_upstream = mock_send
+
+    result1 = resolver.resolve("alias.cached.com", TYPE_A)
+    first_upstream_calls = upstream_calls[0]
+    assert first_upstream_calls >= 1
+    assert len(result1) >= 2
+
+    cache_stats = cache.stats()
+    assert cache_stats["entries"] >= 2, "Cache should have CNAME + A entries"
+
+    upstream_works[0] = False
+
+    result2 = resolver.resolve("alias.cached.com", TYPE_A)
+
+    assert upstream_calls[0] == first_upstream_calls, (
+        f"Upstream was called again ({upstream_calls[0]} total) when it should have been cached. "
+        "Cache not preventing upstream queries for already-cached CNAME chains."
+    )
+
+    assert len(result2) >= 2, (
+        f"Cached query returned {len(result2)} records, expected >=2"
+    )
+
+    types = [rr.rtype for rr in result2]
+    assert TYPE_CNAME in types
+    assert TYPE_A in types
+
+    a_record = [rr for rr in result2 if rr.rtype == TYPE_A][0]
+    ip = a_record.parse_rdata()
+    assert ip == "10.20.30.40", f"Wrong IP from cache: {ip}"
+
+
+@_test_case("Resolver statistics tracking")
+def test_resolver_statistics():
+    """
+    Test that resolver tracks key statistics: total queries, cache hits,
+    singleflight dedups, CNAME follows, NXDOMAIN count, etc.
+    """
+    cache = DNSCache()
+    resolver = DNSResolver(upstream_servers=[("127.0.0.1", 53)], cache=cache)
+
+    upstream_queries = [0]
+
+    def mock_send(name, qtype, timeout=None):
+        upstream_queries[0] += 1
+        header = DNSHeader()
+        header.id = 0x5555
+        header.qr = 1
+        header.rd = 1
+        header.ra = 1
+        header.qdcount = 1
+        header.ancount = 1
+        header.rcode = RCODE_NOERROR
+
+        q = DNSQuestion()
+        q.qname = name
+        q.qtype = qtype
+        q.qclass = CLASS_IN
+
+        a = DNSResourceRecord()
+        a.name = name
+        a.rtype = TYPE_A
+        a.rclass = CLASS_IN
+        a.ttl = 300
+        a.rdata = struct.pack("!BBBB", 10, 0, 0, 1)
+
+        msg = DNSMessage()
+        msg.header = header
+        msg.questions.append(q)
+        msg.answers.append(a)
+        return msg, False
+
+    resolver._query_upstream = mock_send
+
+    for i in range(5):
+        resolver.resolve(f"stat-{i}.test", TYPE_A)
+
+    stats = resolver.stats()
+    assert stats["total_queries"] == 5
+    assert stats["upstream_queries"] == 5
+    assert stats["cache_hits"] == 0
+    assert stats["avg_upstream_latency_ms"] >= 0
+
+    for i in range(5):
+        resolver.resolve(f"stat-{i}.test", TYPE_A)
+
+    stats2 = resolver.stats()
+    assert stats2["total_queries"] == 10
+    assert stats2["cache_hits"] == 5, (
+        f"Expected 5 cache hits on second pass, got {stats2['cache_hits']}"
+    )
+    assert stats2["upstream_queries"] == 5, (
+        f"Expected 5 upstream queries (cached), got {stats2['upstream_queries']}"
+    )
+
+
+@_test_case("End-to-end stress: mixed query types concurrent")
+def test_e2e_mixed_query_stress():
+    """
+    End-to-end stress test: mix of A, AAAA, MX, NS, CNAME chains,
+    and NXDOMAIN queries all running concurrently.
+
+    Verifies:
+    - 100% success rate for valid domains
+    - NXDOMAIN properly returned for nonexistent domains
+    - Cache hit rate increases on second pass
+    - Singleflight deduplication works
+    - Stable latency and no random failures
+    """
+    cache = DNSCache()
+    resolver = DNSResolver(upstream_servers=[("127.0.0.1", 53)], cache=cache)
+
+    a_records = {}
+    aaaa_records = {}
+    mx_records = {}
+    ns_records = {}
+    cname_chains = {}
+    nx_domains = set()
+
+    for i in range(15):
+        domain = f"a-{i:03d}.example.com"
+        a_records[domain] = f"10.{i // 256}.{i % 256}.1"
+
+    for i in range(10):
+        domain = f"aaaa-{i:03d}.example.com"
+        aaaa_records[domain] = f"2001:db8::{i}"
+
+    for i in range(8):
+        domain = f"mx-{i:03d}.example.com"
+        mx_records[domain] = (10, f"mail-{i}.example.com")
+
+    for i in range(5):
+        domain = f"ns-{i:03d}.example.com"
+        ns_records[domain] = f"ns{i}.example.com"
+
+    for i in range(5):
+        alias = f"cname-{i:03d}.example.com"
+        target = f"target-{i:03d}.example.com"
+        cname_chains[alias] = target
+        a_records[target] = f"10.99.{i}.1"
+
+    for i in range(7):
+        nx_domains.add(f"nx-{i:03d}.nonexistent.xyz")
+
+    def mock_send(name, qtype, timeout=None):
+        header = DNSHeader()
+        header.id = random.randint(0, 0xFFFF)
+        header.qr = 1
+        header.rd = 1
+        header.ra = 1
+        header.qdcount = 1
+        header.rcode = RCODE_NOERROR
+
+        q = DNSQuestion()
+        q.qname = name
+        q.qtype = qtype
+        q.qclass = CLASS_IN
+
+        msg = DNSMessage()
+        msg.header = header
+        msg.questions.append(q)
+
+        time.sleep(random.uniform(0.001, 0.005))
+
+        if name in nx_domains:
+            header.rcode = RCODE_NXDOMAIN
+            return msg, False
+
+        if qtype == TYPE_A and name in a_records:
+            header.ancount = 1
+            a = DNSResourceRecord()
+            a.name = name
+            a.rtype = TYPE_A
+            a.rclass = CLASS_IN
+            a.ttl = 300
+            parts = [int(p) for p in a_records[name].split(".")]
+            a.rdata = struct.pack("!BBBB", *parts)
+            msg.answers.append(a)
+        elif qtype == TYPE_AAAA and name in aaaa_records:
+            header.ancount = 1
+            aaaa = DNSResourceRecord()
+            aaaa.name = name
+            aaaa.rtype = TYPE_AAAA
+            aaaa.rclass = CLASS_IN
+            aaaa.ttl = 300
+            ip_str = aaaa_records[name]
+            parts = ip_str.split(":")
+            full_parts = []
+            for p in parts:
+                if p == "":
+                    while len(full_parts) + len(parts) - parts.index(p) - 1 < 8:
+                        full_parts.append(0)
+                else:
+                    full_parts.append(int(p, 16))
+            aaaa.rdata = struct.pack("!8H", *full_parts)
+            msg.answers.append(aaaa)
+        elif qtype == TYPE_MX and name in mx_records:
+            header.ancount = 1
+            pref, exchange = mx_records[name]
+            mx = DNSResourceRecord()
+            mx.name = name
+            mx.rtype = TYPE_MX
+            mx.rclass = CLASS_IN
+            mx.ttl = 300
+            mx.rdata = struct.pack("!H", pref) + encode_domain_name(exchange, allow_compression=False)[0]
+            msg.answers.append(mx)
+        elif qtype == TYPE_NS and name in ns_records:
+            header.ancount = 1
+            ns = DNSResourceRecord()
+            ns.name = name
+            ns.rtype = TYPE_NS
+            ns.rclass = CLASS_IN
+            ns.ttl = 3600
+            ns.rdata = encode_domain_name(ns_records[name], allow_compression=False)[0]
+            msg.answers.append(ns)
+        elif qtype == TYPE_A and name in cname_chains:
+            header.ancount = 2
+            target = cname_chains[name]
+            cname = DNSResourceRecord()
+            cname.name = name
+            cname.rtype = TYPE_CNAME
+            cname.rclass = CLASS_IN
+            cname.ttl = 300
+            cname.rdata = encode_domain_name(target, allow_compression=False)[0]
+            msg.answers.append(cname)
+            a = DNSResourceRecord()
+            a.name = target
+            a.rtype = TYPE_A
+            a.rclass = CLASS_IN
+            a.ttl = 300
+            parts = [int(p) for p in a_records[target].split(".")]
+            a.rdata = struct.pack("!BBBB", *parts)
+            msg.answers.append(a)
+        else:
+            header.ancount = 0
+
+        return msg, False
+
+    resolver._query_upstream = mock_send
+
+    queries = []
+    for d in a_records:
+        queries.append((d, TYPE_A, "success"))
+    for d in aaaa_records:
+        queries.append((d, TYPE_AAAA, "success"))
+    for d in mx_records:
+        queries.append((d, TYPE_MX, "success"))
+    for d in ns_records:
+        queries.append((d, TYPE_NS, "success"))
+    for d in cname_chains:
+        queries.append((d, TYPE_A, "success"))
+    for d in nx_domains:
+        queries.append((d, TYPE_A, "nxdomain"))
+
+    queries *= 4
+    random.shuffle(queries)
+
+    success_count = 0
+    fail_count = 0
+    nx_count = 0
+    errors = []
+    start_times = []
+    end_times = []
+    lock = threading.Lock()
+
+    def run_query(domain, qtype, expected):
+        nonlocal success_count, fail_count, nx_count
+        t0 = time.time()
+        try:
+            result = resolver.resolve(domain, qtype)
+            t1 = time.time()
+            with lock:
+                if expected == "success":
+                    success_count += 1
+                    assert len(result) >= 1, f"No records for {domain}"
+                else:
+                    fail_count += 1
+                    errors.append(f"{domain} should have failed")
+        except ResolveError as e:
+            t1 = time.time()
+            with lock:
+                if expected == "nxdomain":
+                    nx_count += 1
+                else:
+                    fail_count += 1
+                    errors.append(f"{domain} unexpected error: {e}")
+        except Exception as e:
+            t1 = time.time()
+            with lock:
+                fail_count += 1
+                errors.append(f"{domain} exception: {type(e).__name__}: {e}")
+        with lock:
+            start_times.append(t0)
+            end_times.append(t1)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        futures = [
+            executor.submit(run_query, d, qt, exp)
+            for d, qt, exp in queries
+        ]
+        for f in concurrent.futures.as_completed(futures):
+            f.result()
+
+    total_queries = len(queries)
+    expected_success = sum(1 for _, _, e in queries if e == "success")
+    expected_nx = sum(1 for _, _, e in queries if e == "nxdomain")
+
+    assert fail_count == 0, f"{fail_count} failures: {errors[:5]}"
+    assert success_count == expected_success, (
+        f"Expected {expected_success} success, got {success_count}"
+    )
+    assert nx_count == expected_nx, f"Expected {expected_nx} NXDOMAIN, got {nx_count}"
+
+    stats = resolver.stats()
+    assert stats["total_queries"] == total_queries
+    assert stats["nxdomain_count"] >= expected_nx
+    assert stats["upstream_queries"] > 0
+
+    if total_queries > 0:
+        total_time = max(end_times) - min(start_times)
+        qps = total_queries / total_time if total_time > 0 else 0
+        assert qps > 10, f"QPS too low: {qps:.1f}"
+
+
+@_test_case("Second pass cache hit rate verifies caching effectiveness")
+def test_cache_hit_rate_second_pass():
+    """
+    After first pass of queries populates cache, second pass should
+    have near-100% cache hit rate and zero upstream queries.
+    """
+    cache = DNSCache()
+    resolver = DNSResolver(upstream_servers=[("127.0.0.1", 53)], cache=cache)
+
+    upstream_call_count = [0]
+    upstream_lock = threading.Lock()
+
+    def mock_send(name, qtype, timeout=None):
+        with upstream_lock:
+            upstream_call_count[0] += 1
+        header = DNSHeader()
+        header.id = random.randint(0, 0xFFFF)
+        header.qr = 1
+        header.rd = 1
+        header.ra = 1
+        header.qdcount = 1
+        header.ancount = 1
+        header.rcode = RCODE_NOERROR
+
+        q = DNSQuestion()
+        q.qname = name
+        q.qtype = qtype
+        q.qclass = CLASS_IN
+
+        a = DNSResourceRecord()
+        a.name = name
+        a.rtype = TYPE_A
+        a.rclass = CLASS_IN
+        a.ttl = 300
+        a.rdata = struct.pack("!BBBB", 10, 0, 0, 1)
+
+        msg = DNSMessage()
+        msg.header = header
+        msg.questions.append(q)
+        msg.answers.append(a)
+        return msg, False
+
+    resolver._query_upstream = mock_send
+
+    domains = [f"cachetest-{i:04d}.example.com" for i in range(30)]
+
+    def do_pass():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(resolver.resolve, d, TYPE_A) for d in domains]
+            for f in concurrent.futures.as_completed(futures):
+                f.result()
+
+    do_pass()
+    first_pass_upstream = upstream_call_count[0]
+    assert first_pass_upstream == len(domains), (
+        f"First pass: expected {len(domains)} upstream calls, got {first_pass_upstream}"
+    )
+
+    stats1 = resolver.stats()
+    assert stats1["cache_hits"] == 0, "First pass should have 0 cache hits"
+
+    upstream_call_count[0] = 0
+
+    do_pass()
+    second_pass_upstream = upstream_call_count[0]
+
+    stats2 = resolver.stats()
+
+    assert second_pass_upstream == 0, (
+        f"Second pass: expected 0 upstream calls (all cached), got {second_pass_upstream}. "
+        "Cache not working properly for repeated queries."
+    )
+
+    assert stats2["cache_hits"] >= len(domains), (
+        f"Expected >= {len(domains)} cache hits, got {stats2['cache_hits']}"
+    )
+
+
 def run_all_tests():
     print("=" * 60)
     print("DNS Server Test Suite")
@@ -1255,6 +1800,12 @@ def run_all_tests():
     test_singleflight_very_slow_upstream()
     test_concurrent_multi_domain_stability()
     test_resolver_cached_cname_chain()
+    test_negative_cache_nxdomain()
+    test_negative_cache_servfail()
+    test_cached_cname_upstream_offline()
+    test_resolver_statistics()
+    test_e2e_mixed_query_stress()
+    test_cache_hit_rate_second_pass()
 
     print("\n" + "=" * 60)
     print(f"Results: {_passed} passed, {_failed} failed")

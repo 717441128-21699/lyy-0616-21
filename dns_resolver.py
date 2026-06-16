@@ -16,15 +16,18 @@ from dns_message import (
     TYPE_MX,
     TYPE_NS,
     TYPE_ANY,
+    TYPE_OPT,
     CLASS_IN,
     RCODE_NOERROR,
     RCODE_NXDOMAIN,
     RCODE_SERVFAIL,
     parse_domain_name,
+    encode_domain_name,
     DNSSecurityError,
     DNSParseError,
     MAX_MESSAGE_SIZE,
     MAX_UDP_PAYLOAD,
+    MAX_EDNS_PAYLOAD,
 )
 from dns_cache import DNSCache
 from singleflight import Singleflight
@@ -42,6 +45,7 @@ UPSTREAM_TIMEOUT = 5.0
 TOTAL_RESOLVE_TIMEOUT = 30.0
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 0.5
+TCP_TIMEOUT = 10.0
 
 
 logger = logging.getLogger("dns.resolver")
@@ -53,14 +57,17 @@ class ResolveError(Exception):
 
 class DNSResolver:
     """
-    Recursive DNS resolver with caching and singleflight deduplication.
+    Recursive DNS resolver with caching, singleflight, TCP fallback, and EDNS0.
 
-    Key improvements:
-    - Each upstream query uses its own UDP socket (no shared socket race conditions)
-    - Full CNAME chain is collected and returned (not just final answers)
-    - Longer singleflight timeout matches total possible upstream time
-    - Better retry with exponential backoff and server rotation
-    - Stable concurrent query handling
+    Key features:
+    - Per-query UDP sockets (no shared socket race conditions)
+    - TCP fallback when UDP response is truncated (TC bit set)
+    - EDNS0 support for larger UDP payloads (4096 bytes)
+    - Full CNAME chain collection and return
+    - Negative caching for NXDOMAIN / SERVFAIL
+    - Singleflight deduplication with long timeout support
+    - Exponential backoff retries with multiple upstream servers
+    - Detailed statistics tracking
     """
 
     def __init__(self, upstream_servers=None, cache=None):
@@ -73,6 +80,27 @@ class DNSResolver:
         self._server_rotation = 0
         self._rotation_lock = threading.Lock()
 
+        self._stats = {
+            "total_queries": 0,
+            "cache_hits": 0,
+            "negative_cache_hits": 0,
+            "upstream_queries": 0,
+            "tcp_fallbacks": 0,
+            "singleflight_dedups": 0,
+            "cname_followed": 0,
+            "nxdomain_count": 0,
+            "servfail_count": 0,
+            "upstream_time_total": 0.0,
+            "upstream_time_count": 0,
+            "retries_total": 0,
+            "truncated_count": 0,
+        }
+        self._stats_lock = threading.Lock()
+
+    def _inc_stat(self, key, value=1):
+        with self._stats_lock:
+            self._stats[key] = self._stats.get(key, 0) + value
+
     def _get_next_server(self):
         """Round-robin server selection."""
         with self._rotation_lock:
@@ -80,15 +108,10 @@ class DNSResolver:
             self._server_rotation += 1
             return self.upstream_servers[idx]
 
-    def _send_query_upstream(self, name, qtype, timeout=UPSTREAM_TIMEOUT):
-        """
-        Send a single DNS query to upstream servers.
-
-        Uses a fresh UDP socket per call to avoid concurrent access issues.
-        Tries multiple servers with retries and exponential backoff.
-        """
+    def _build_query(self, name, qtype, id=None, edns=True):
+        """Build a DNS query message."""
         query = DNSMessage()
-        query.header.id = random.randint(0, 0xFFFF)
+        query.header.id = id if id is not None else random.randint(0, 0xFFFF)
         query.header.rd = 1
         query.header.qdcount = 1
 
@@ -98,8 +121,114 @@ class DNSResolver:
         q.qclass = CLASS_IN
         query.questions.append(q)
 
-        query_data = query.pack(max_size=MAX_UDP_PAYLOAD)
-        expected_id = query.header.id
+        if edns:
+            opt_rr = DNSResourceRecord()
+            opt_rr.name = ""
+            opt_rr.rtype = TYPE_OPT
+            opt_rr.rclass = MAX_EDNS_PAYLOAD
+            opt_rr.ttl = 0
+            opt_rr.rdata = b""
+            query.additionals.append(opt_rr)
+            query.header.arcount = 1
+
+        return query
+
+    def _send_udp_query(self, server, query_data, expected_id, timeout):
+        """
+        Send a UDP DNS query and receive the response.
+
+        Returns response data or None on failure.
+        """
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(timeout)
+            sock.sendto(query_data, server)
+            response_data, _ = sock.recvfrom(MAX_MESSAGE_SIZE)
+            return response_data
+        except (socket.timeout, OSError):
+            return None
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def _send_tcp_query(self, server, query_data, expected_id, timeout):
+        """
+        Send a TCP DNS query (with 2-byte length prefix) and receive response.
+
+        Returns response data or None on failure.
+        """
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect(server)
+
+            tcp_query = struct.pack("!H", len(query_data)) + query_data
+            sock.sendall(tcp_query)
+
+            length_data = b""
+            while len(length_data) < 2:
+                chunk = sock.recv(2 - len(length_data))
+                if not chunk:
+                    return None
+                length_data += chunk
+
+            msg_length = struct.unpack("!H", length_data)[0]
+            if msg_length > MAX_MESSAGE_SIZE or msg_length < 12:
+                return None
+
+            response_data = b""
+            while len(response_data) < msg_length:
+                chunk = sock.recv(min(4096, msg_length - len(response_data)))
+                if not chunk:
+                    return None
+                response_data += chunk
+
+            return response_data
+        except (socket.timeout, OSError, struct.error):
+            return None
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def _validate_response(self, response_data, expected_id):
+        """
+        Validate a DNS response.
+
+        Returns DNSMessage or None if invalid.
+        """
+        if not response_data or len(response_data) < 12:
+            return None
+
+        try:
+            response_id = struct.unpack_from("!H", response_data, 0)[0]
+            if response_id != expected_id:
+                return None
+
+            response = DNSMessage.unpack(response_data)
+            return response
+        except (DNSParseError, DNSSecurityError, struct.error):
+            return None
+
+    def _query_upstream(self, name, qtype, timeout=UPSTREAM_TIMEOUT, use_tcp=False):
+        """
+        Send a DNS query to upstream servers with retries.
+
+        Tries each server with retries and exponential backoff.
+        Falls back to TCP if UDP returns truncated response.
+
+        Returns (response, used_tcp) or raises ResolveError.
+        """
+        query_id = random.randint(0, 0xFFFF)
+        query = self._build_query(name, qtype, id=query_id, edns=not use_tcp)
+        query_data = query.pack(max_size=MAX_MESSAGE_SIZE)
 
         last_error = None
         servers = list(self.upstream_servers)
@@ -107,66 +236,70 @@ class DNSResolver:
 
         for attempt in range(MAX_RETRIES):
             for server in servers:
-                sock = None
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    sock.settimeout(timeout)
+                start = time.time()
 
-                    sock.sendto(query_data, server)
-                    try:
-                        response_data, _ = sock.recvfrom(MAX_MESSAGE_SIZE)
-                    except socket.timeout:
-                        last_error = f"Timeout querying {server} (attempt {attempt+1})"
-                        continue
-                    except OSError as e:
-                        last_error = f"Network error from {server}: {e}"
-                        continue
-                    finally:
-                        try:
-                            sock.close()
-                        except Exception:
-                            pass
+                if use_tcp:
+                    self._inc_stat("tcp_fallbacks")
+                    response_data = self._send_tcp_query(
+                        server, query_data, query_id, timeout
+                    )
+                else:
+                    response_data = self._send_udp_query(
+                        server, query_data, query_id, timeout
+                    )
 
-                    if len(response_data) < 12:
-                        last_error = f"Truncated response from {server}"
-                        continue
-
-                    try:
-                        response_id = struct.unpack_from("!H", response_data, 0)[0]
-                        if response_id != expected_id:
-                            last_error = f"ID mismatch from {server}"
-                            continue
-                    except Exception as e:
-                        last_error = f"Error reading ID from {server}: {e}"
-                        continue
-
-                    try:
-                        response = DNSMessage.unpack(response_data)
-                    except (DNSParseError, DNSSecurityError) as e:
-                        last_error = f"Parse error from {server}: {e}"
-                        continue
-                    except Exception as e:
-                        last_error = f"Unexpected error parsing response: {e}"
-                        continue
-
-                    return response
-
-                except Exception as e:
-                    last_error = str(e)
-                    if sock:
-                        try:
-                            sock.close()
-                        except Exception:
-                            pass
+                if response_data is None:
+                    last_error = f"No response from {server}"
                     continue
 
+                response = self._validate_response(response_data, query_id)
+                if response is None:
+                    last_error = f"Invalid response from {server}"
+                    continue
+
+                elapsed = time.time() - start
+                self._inc_stat("upstream_time_total", elapsed)
+                self._inc_stat("upstream_time_count")
+                self._inc_stat("upstream_queries")
+
+                if response.header.tc and not use_tcp:
+                    self._inc_stat("truncated_count")
+                    logger.debug(f"Truncated response from {server}, falling back to TCP")
+                    tcp_response = self._query_upstream_tcp_only(name, qtype, timeout)
+                    if tcp_response is not None:
+                        self._inc_stat("tcp_fallbacks")
+                        return tcp_response, True
+                    last_error = "TCP fallback failed"
+                    continue
+
+                return response, use_tcp
+
             if attempt < MAX_RETRIES - 1:
+                self._inc_stat("retries_total")
                 backoff = RETRY_BACKOFF_BASE * (2 ** attempt)
                 time.sleep(backoff)
 
         raise ResolveError(
             f"All upstream servers failed after {MAX_RETRIES} attempts. Last error: {last_error}"
         )
+
+    def _query_upstream_tcp_only(self, name, qtype, timeout):
+        """Try TCP query to all servers, return first success or None."""
+        query_id = random.randint(0, 0xFFFF)
+        query = self._build_query(name, qtype, id=query_id, edns=False)
+        query_data = query.pack(max_size=MAX_MESSAGE_SIZE)
+
+        servers = list(self.upstream_servers)
+        random.shuffle(servers)
+
+        for server in servers:
+            response_data = self._send_tcp_query(server, query_data, query_id, timeout)
+            if response_data is None:
+                continue
+            response = self._validate_response(response_data, query_id)
+            if response is not None:
+                return response
+        return None
 
     def _resolve_upstream(self, name, qtype):
         """
@@ -186,19 +319,32 @@ class DNSResolver:
                 raise ResolveError("CNAME loop detected")
             visited_cnames.add(current_name_lower)
 
-            response = self._send_query_upstream(current_name, qtype)
+            negative = self.cache.get_negative(current_name, qtype)
+            if negative is not None:
+                rcode, ttl = negative
+                self._inc_stat("negative_cache_hits")
+                if rcode == RCODE_NXDOMAIN:
+                    self._inc_stat("nxdomain_count")
+                elif rcode == RCODE_SERVFAIL:
+                    self._inc_stat("servfail_count")
+                raise ResolveError(f"Negative cache hit: rcode={rcode}")
+
+            response, _ = self._query_upstream(current_name, qtype)
             last_response = response
 
+            self.cache.put_response_records(
+                response, query_name=current_name, query_type=qtype
+            )
+
             if response.header.rcode == RCODE_NXDOMAIN:
-                self.cache.put_response_records(response)
+                self._inc_stat("nxdomain_count")
                 return full_chain, response
 
             if response.header.rcode != RCODE_NOERROR:
+                self._inc_stat("servfail_count")
                 raise ResolveError(
                     f"Upstream returned rcode {response.header.rcode}"
                 )
-
-            self.cache.put_response_records(response)
 
             direct_answers = [
                 rr for rr in response.answers
@@ -215,6 +361,7 @@ class DNSResolver:
             if cname_answers:
                 cname_rr = cname_answers[0]
                 full_chain.append(cname_rr)
+                self._inc_stat("cname_followed")
                 try:
                     target = cname_rr.parse_rdata()
                     if target:
@@ -237,14 +384,30 @@ class DNSResolver:
         Resolve a DNS name and type.
 
         Flow:
-        1. Cache lookup (follows CNAME chains)
-        2. Singleflight deduplication for upstream queries
-        3. Returns full CNAME chain + final answers
+        1. Check negative cache
+        2. Positive cache lookup (follows CNAME chains)
+        3. Singleflight deduplication for upstream queries
+        4. Returns full CNAME chain + final answers
 
         Returns list of DNSResourceRecord.
+        Raises ResolveError on failure.
         """
-        cached, cname_chain = self.cache.get_with_cname_follow(name, qtype)
-        if cached:
+        self._inc_stat("total_queries")
+
+        negative = self.cache.get_negative(name, qtype)
+        if negative is not None:
+            rcode, ttl = negative
+            self._inc_stat("negative_cache_hits")
+            if rcode == RCODE_NXDOMAIN:
+                self._inc_stat("nxdomain_count")
+                raise ResolveError("NXDOMAIN (negative cache)")
+            elif rcode == RCODE_SERVFAIL:
+                self._inc_stat("servfail_count")
+                raise ResolveError("SERVFAIL (negative cache)")
+
+        cached, cname_chain, complete = self.cache.get_with_cname_follow(name, qtype)
+        if complete and cached:
+            self._inc_stat("cache_hits")
             return cname_chain + cached
 
         key = (name.lower(), qtype)
@@ -256,19 +419,44 @@ class DNSResolver:
             key, do_work, timeout=TOTAL_RESOLVE_TIMEOUT
         )
 
+        if was_dup:
+            self._inc_stat("singleflight_dedups")
+
         if error is not None:
             raise error
 
         upstream_chain, _ = result
 
-        cached, cname_chain = self.cache.get_with_cname_follow(name, qtype)
-        if cached:
+        cached, cname_chain, complete = self.cache.get_with_cname_follow(name, qtype)
+        if complete and cached:
             return cname_chain + cached
 
         return upstream_chain
 
     def stats(self):
-        return {
-            "cache": self.cache.stats(),
-            "singleflight": self.singleflight.stats(),
-        }
+        """Get detailed resolver statistics."""
+        with self._stats_lock:
+            s = dict(self._stats)
+
+        cache_stats = self.cache.stats()
+        sf_stats = self.singleflight.stats()
+
+        if s["upstream_time_count"] > 0:
+            s["avg_upstream_latency_ms"] = int(
+                (s["upstream_time_total"] / s["upstream_time_count"]) * 1000
+            )
+        else:
+            s["avg_upstream_latency_ms"] = 0
+
+        s["cache"] = cache_stats
+        s["singleflight"] = sf_stats
+
+        return s
+
+    def reset_stats(self):
+        """Reset all statistics counters."""
+        with self._stats_lock:
+            for k in list(self._stats.keys()):
+                self._stats[k] = 0
+        self.cache.clear()
+        self.singleflight.reset_stats()
